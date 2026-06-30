@@ -25,6 +25,9 @@
 #include <filesystem>
 #include <utility>
 #include <fstream>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -190,6 +193,11 @@ struct server_slot {
     int32_t n_decoded   = 0;
     int32_t n_remaining = -1;
     int32_t i_batch     = -1;
+
+    // async output processing: set by the worker thread when it determines this
+    // slot has hit a stop condition; consumed (final response + release) on the
+    // main thread. See LLAMA_ASYNC_OUTPUT path in update_slots().
+    bool async_to_release = false;
 
     int32_t n_prompt_tokens_cache     = 0;
     int32_t n_prompt_tokens_processed = 0;
@@ -849,6 +857,22 @@ struct server_metrics {
 
 
 //
+// async output processing
+//
+
+// A unit of deferred post-decode work. The main thread samples + detokenizes a
+// token (must stay on the main thread: logits are per-step and slot.n_decoded
+// must not race), then hands the rest of process_token() — generated_text
+// accumulation, stop-string matching, streaming response — to the worker thread,
+// which runs it concurrently with the GPU decode of the NEXT step.
+    struct async_output_job {
+        server_slot *           slot = nullptr;
+        completion_token_output result;
+        int                     prompt_n_tokens = 0;     // snapshot at collection time (exact ctx-limit check)
+        bool                    accept_special  = false; // snapshot on main; used for deferred detok on the worker
+    };
+
+//
 // server_context_impl (private implementation)
 //
 
@@ -874,6 +898,14 @@ public:
 
     server_context_impl() {
         mtmd_helper_log_set(common_log_default_callback, nullptr);
+        // async output processing is opt-in via env (prototype flag). When off,
+        // the post-decode path is byte-for-byte identical to upstream.
+        if (const char * env = getenv("LLAMA_ASYNC_OUTPUT")) {
+            async_output = atoi(env) != 0;
+            if (async_output) {
+                SRV_INF("%s", "async output processing ENABLED (LLAMA_ASYNC_OUTPUT)\n");
+            }
+        }
     }
 
     ~server_context_impl() {
@@ -937,7 +969,35 @@ private:
 
     int64_t t_last_load_progress_ms = 0;
 
+    // === async output processing (LLAMA_ASYNC_OUTPUT=1) ========================
+    // A single worker thread runs the deferred half of process_token() for the
+    // PREVIOUS step's tokens while the main thread is blocked in llama_decode()
+    // for the current step. The worker overlaps ONLY decode() (which touches the
+    // ctx/batch, never slot output fields), so there are no slot data races:
+    //   - main owns: sampling, slot.sampled, n_decoded, slot.state, slot.prompt,
+    //     detok (common_token_to_piece), slot.release(), metrics, final response.
+    //   - worker owns (per-slot exclusive): generated_text, generated_tokens,
+    //     n_sent_text, has_next_token, stop, has_new_line, last_nl_pos, add_token,
+    //     and streaming send_partial_response (queue_results is thread-safe).
+    // Stop conditions found by the worker are flagged (slot.async_to_release) and
+    // finalized on the main thread one step later (<=1 wasted GPU decode; output
+    // is byte-identical to the sync path).
+    bool                          async_output         = false;
+    bool                          async_worker_started = false;
+    bool                          async_shutdown       = false;
+    bool                          async_has_work       = false; // jobs submitted, not yet picked up
+    bool                          async_busy           = false; // worker actively processing
+    std::thread                   async_worker;
+    std::mutex                    async_mtx;
+    std::condition_variable       async_cv_work;                // main -> worker
+    std::condition_variable       async_cv_done;                // worker -> main
+    std::vector<async_output_job> async_pending;                // collected by main, awaiting kick
+    std::vector<async_output_job> async_pending_for_worker;     // handed to worker by async_kick()
+    std::vector<async_output_job> async_inflight;               // worker's local processing buffer
+    std::vector<server_slot *>    async_released;               // worker -> main: slots to finalize
+
     void destroy() {
+        async_stop_worker();
         spec.reset();
         ctx_dft.reset();
         model_dft.reset();
@@ -1859,10 +1919,16 @@ private:
         return true;
     }
 
-    bool process_token(completion_token_output & result, server_slot & slot) {
+    bool process_token(completion_token_output & result, server_slot & slot,
+                       bool from_async = false, int async_prompt_n_tokens = -1) {
         // remember which tokens were sampled - used for repetition penalties during sampling
         const std::string token_str = result.text_to_send;
-        slot.sampled = result.tok;
+        // In the async path the main thread has already set slot.sampled (it owns
+        // that field and uses it to build the next batch); the worker must NOT
+        // write it (would race with the main thread reading it in pre_decode).
+        if (!from_async) {
+            slot.sampled = result.tok;
+        }
 
         slot.generated_text += token_str;
         if (slot.task->params.return_tokens) {
@@ -1912,13 +1978,16 @@ private:
         }
 
         // if context shifting is disabled, make sure that we don't run out of context
-        if (!params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
+        // (async: use the prompt size snapshotted at collection time so the check
+        //  matches the sync path exactly — pre_decode may have already appended)
+        const int eff_prompt_n_tokens = from_async ? async_prompt_n_tokens : slot.prompt.n_tokens();
+        if (!params_base.ctx_shift && eff_prompt_n_tokens + 1 >= slot.n_ctx) {
             slot.truncated      = true;
             slot.stop           = STOP_TYPE_LIMIT;
             slot.has_next_token = false;
 
             SLT_DBG(slot, "stopped due to running out of context capacity, prompt.n_tokens() = %d, task.n_tokens = %d, n_decoded = %d, n_ctx = %d\n",
-                    slot.prompt.n_tokens(), slot.task->n_tokens(), slot.n_decoded, slot.n_ctx);
+                    eff_prompt_n_tokens, slot.task->n_tokens(), slot.n_decoded, slot.n_ctx);
         }
 
         // check the limits
@@ -2725,12 +2794,159 @@ private:
     }
 
     void abort_all_slots(const std::string & reason) {
+        // make sure the async worker isn't touching any slot before we tear them down
+        async_wait_idle();
+        async_apply_releases();
+        async_pending.clear();
         for (auto & slot : slots) {
             if (slot.is_processing()) {
                 send_error(slot, reason, ERROR_TYPE_SERVER);
                 slot.release();
             }
         }
+    }
+
+    // ===================== async output processing helpers =====================
+
+    // Worker thread: runs the deferred half of process_token() for a batch of
+    // jobs. While this runs, the main thread is inside llama_decode() for the
+    // next step (decode() touches only ctx/batch, never the slot output fields
+    // this function mutates), so no locking of slot state is required here.
+    void async_worker_loop() {
+        while (true) {
+            {
+                std::unique_lock<std::mutex> lk(async_mtx);
+                async_cv_work.wait(lk, [&]{ return async_has_work || async_shutdown; });
+                if (async_shutdown && !async_has_work) {
+                    return;
+                }
+                async_inflight.swap(async_pending_for_worker);
+                async_has_work = false;
+                async_busy     = true;
+            }
+
+            for (auto & job : async_inflight) {
+                server_slot * slot = job.slot;
+                if (slot->async_to_release) {
+                    continue; // already stopped on an earlier step
+                }
+                bool cont;
+                try {
+                    // Deferred detokenization — the expensive part of post-decode.
+                    // Runs here (overlapping the next GPU decode) instead of on the
+                    // main thread. Reads only the immutable vocab via ctx_tgt.
+                    job.result.text_to_send = common_token_to_piece(slot->ctx_tgt, job.result.tok, job.accept_special);
+                    cont = process_token(job.result, *slot, /*from_async=*/true, job.prompt_n_tokens);
+                } catch (const std::exception & e) {
+                    SRV_ERR("async process_token() failed: %s\n", e.what());
+                    cont = false;
+                }
+                if (!cont) {
+                    // stop condition: hand the slot back to the main thread, which
+                    // owns slot lifecycle, metrics and the final response.
+                    std::lock_guard<std::mutex> lk(async_mtx);
+                    slot->async_to_release = true;
+                    async_released.push_back(slot);
+                } else {
+                    slot->print_timings_tg();
+                }
+            }
+            async_inflight.clear();
+
+            {
+                std::lock_guard<std::mutex> lk(async_mtx);
+                async_busy = false;
+                async_cv_done.notify_all();
+            }
+        }
+    }
+
+    // hand the pending jobs to the worker (no-op if none). Returns immediately;
+    // the worker runs concurrently with the subsequent llama_decode().
+    void async_kick() {
+        if (async_pending.empty()) {
+            return;
+        }
+        if (!async_worker_started) {
+            async_worker_started = true;
+            async_shutdown       = false;
+            async_worker         = std::thread([this]{ async_worker_loop(); });
+        }
+        std::unique_lock<std::mutex> lk(async_mtx);
+        async_pending_for_worker.swap(async_pending); // pending -> worker queue
+        async_pending.clear();
+        async_has_work = true;
+        async_cv_work.notify_all();
+    }
+
+    // block until the worker has finished the jobs handed to it by async_kick()
+    void async_wait_idle() {
+        if (!async_worker_started) {
+            return;
+        }
+        std::unique_lock<std::mutex> lk(async_mtx);
+        async_cv_done.wait(lk, [&]{ return !async_has_work && !async_busy; });
+    }
+
+    // finalize slots the worker flagged as stopped (main thread: metrics +
+    // final response + release). Safe to call only when the worker is idle.
+    void async_apply_releases() {
+        std::vector<server_slot *> released;
+        {
+            std::lock_guard<std::mutex> lk(async_mtx);
+            released.swap(async_released);
+        }
+        for (server_slot * slot : released) {
+            slot->print_timings();
+            send_final_response(*slot);
+            metrics.on_prediction(*slot);
+            slot->async_to_release = false;
+            slot->release();
+        }
+    }
+
+    // process any leftover pending jobs synchronously on the main thread. Used
+    // when no further decode is coming this round (empty batch), so the worker
+    // would otherwise never be kicked and the final responses would be lost.
+    void async_drain_pending_sync() {
+        if (async_pending.empty()) {
+            return;
+        }
+        for (auto & job : async_pending) {
+            server_slot * slot = job.slot;
+            if (slot->async_to_release) {
+                continue;
+            }
+            if (!process_token(job.result, *slot, /*from_async=*/true, job.prompt_n_tokens)) {
+                slot->print_timings();
+                send_final_response(*slot);
+                metrics.on_prediction(*slot);
+                slot->async_to_release = false;
+                slot->release();
+            } else {
+                slot->print_timings_tg();
+            }
+        }
+        async_pending.clear();
+    }
+
+    void async_stop_worker() {
+        if (!async_worker_started) {
+            return;
+        }
+        async_wait_idle();
+        {
+            std::lock_guard<std::mutex> lk(async_mtx);
+            async_shutdown = true;
+            async_cv_work.notify_all();
+        }
+        if (async_worker.joinable()) {
+            async_worker.join();
+        }
+        async_worker_started = false;
+        async_shutdown       = false;
+        async_inflight.clear();
+        async_pending_for_worker.clear();
     }
 
     // @ngxson : for debugging only
@@ -2789,6 +3005,15 @@ private:
             }
 
             if (all_idle) {
+                // async output processing: defensively flush any worker-flagged
+                // releases (their final responses) before going idle. By design
+                // async_pending only references still-processing slots, so it is
+                // empty here; clear it as belt-and-suspenders against stale jobs.
+                if (async_output) {
+                    async_wait_idle();
+                    async_apply_releases();
+                    async_pending.clear();
+                }
                 SRV_TRC("%s", "all slots are idle\n");
                 return; // skip further processing
 
@@ -2810,11 +3035,27 @@ private:
             abort_all_slots("pre_decode() failed: " + std::string(e.what()));
         }
 
+        // async output processing: if no decode is coming this round, the deferred
+        // jobs from the previous step would never be kicked to the worker -> drain
+        // them synchronously so their final responses are never lost.
+        if (async_output && batch.size() == 0) {
+            async_drain_pending_sync();
+        }
+
         llama_batch batch_view;
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
             const int32_t n_tokens = std::min(n_batch, batch.size() - off);
+
+            // async output processing: hand the PREVIOUS step's deferred jobs to the
+            // worker now, so its CPU work overlaps the GPU decode below. The worker
+            // touches only slot output fields (not ctx/batch), so it cannot race
+            // with decode(). pre_decode() above already ran with the worker idle.
+            if (async_output) {
+                async_kick();
+            }
+
             try {
                 scoped_timer t(t_decode, n_decode);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
@@ -2841,9 +3082,18 @@ private:
                 break; // stop any further processing
             }
 
+            // async output processing: the worker must finish the previous step's
+            // jobs before we sample/finalize this step (main writes slot.n_decoded
+            // and releases slots, which the worker reads). The wait is ~free when
+            // the worker fits inside the decode() window above.
+            if (async_output) {
+                async_wait_idle();
+                async_apply_releases();
+            }
+
             try {
                 scoped_timer t(t_post_decode, n_post_decode);
-                post_decode(n_tokens, off, batch_view);
+                post_decode(n_tokens, off, batch_view, async_output ? &async_pending : nullptr);
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
@@ -3704,7 +3954,8 @@ private:
         return true;
     }
 
-    void post_decode(int32_t n_batch_tokens, int32_t off, llama_batch & batch_view) {
+    void post_decode(int32_t n_batch_tokens, int32_t off, llama_batch & batch_view,
+                     std::vector<async_output_job> * defer_jobs = nullptr) {
         // for checking if a given batch index is inside batch_view
         auto is_inside_view = [&](int32_t idx) {
             return idx >= off && idx < off + n_batch_tokens;
@@ -3800,12 +4051,40 @@ private:
 
             completion_token_output result;
             result.tok          = id;
-            result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
             result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
 
+            const bool special = accept_special_token(slot, result.tok);
+
+            // Token probabilities read this step's logits via tok_idx. The async
+            // worker runs DURING the next llama_decode(), which overwrites those
+            // logits, so probs MUST be extracted here on the main thread. (n_probs
+            // is 0 for normal generation, so this is free in the common case.)
             if (slot.task->params.sampling.n_probs > 0) {
                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
             }
+
+            if (defer_jobs) {
+                // async output processing: the main thread owns slot.sampled (used
+                // to build the next batch), so set it here. EVERYTHING ELSE —
+                // detokenization (common_token_to_piece), text accumulation,
+                // stop-string matching and the streaming response — is deferred to
+                // the worker thread and runs concurrently with the next
+                // llama_decode(). Detok reads only the immutable vocab (never the
+                // logits/KV), so it is safe off the main thread; moving it here is
+                // what actually fills the GPU bubble (post_decode was ~14 ms/step,
+                // dominated by detok, while decode is ~20 ms).
+                slot.sampled = result.tok;
+                async_output_job job;
+                job.slot            = &slot;
+                job.prompt_n_tokens = slot.prompt.n_tokens(); // snapshot for exact ctx-limit check
+                job.accept_special  = special;                // snapshot for deferred detok
+                job.result          = std::move(result);
+                defer_jobs->push_back(std::move(job));
+                return;
+            }
+
+            // synchronous path: detokenize inline before processing
+            result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, special);
 
             if (!process_token(result, slot)) {
                 // release slot because of stop condition

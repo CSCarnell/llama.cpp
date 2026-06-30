@@ -2332,6 +2332,12 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     for (const auto & lora : model.loras) {
         res += lora->get_n_nodes();
     }
+    // Headroom for backend (GPU) sampling: when enabled, the sampler chain appends a
+    // bounded number of graph nodes per output row (one row per concurrent sequence).
+    // The base estimate above does not account for these, which overflows the graph
+    // meta-context by a small margin at high --parallel (e.g. needed 1978176 vs
+    // available 1977808 at 48 slots). Budget generously; the meta context is tiny.
+    res += cparams.n_seq_max * 64;
     return res;
 }
 
