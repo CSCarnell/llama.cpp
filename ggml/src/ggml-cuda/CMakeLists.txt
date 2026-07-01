@@ -131,6 +131,24 @@ if (CUDAToolkit_FOUND)
 
     add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
 
+    # ---- CUTLASS grouped NVFP4 MoE (sm120) : single grouped GEMM vs per-expert storm ----
+    if (GGML_CUDA_CUTLASS_FP4)
+        if (NOT DEFINED GGML_CUDA_CUTLASS_DIR)
+            set(GGML_CUDA_CUTLASS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../cutlass")
+        endif()
+        if (NOT EXISTS "${GGML_CUDA_CUTLASS_DIR}/include/cutlass/cutlass.h")
+            message(FATAL_ERROR "GGML_CUDA_CUTLASS_FP4=ON but CUTLASS not found at ${GGML_CUDA_CUTLASS_DIR}")
+        endif()
+        message(STATUS "CUTLASS grouped FP4 MoE ENABLED; dir: ${GGML_CUDA_CUTLASS_DIR}")
+        target_include_directories(ggml-cuda PRIVATE
+            "${GGML_CUDA_CUTLASS_DIR}/include"
+            "${GGML_CUDA_CUTLASS_DIR}/tools/util/include")
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_CUTLASS_FP4)
+        target_compile_options(ggml-cuda PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+            $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
+    endif()
+
     if (GGML_CUDA_GRAPHS)
         add_compile_definitions(GGML_CUDA_USE_GRAPHS)
     endif()

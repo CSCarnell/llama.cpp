@@ -4,6 +4,9 @@
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
+#ifdef GGML_CUDA_CUTLASS_FP4
+#include "ggml-cuda/cutlass-moe-fp4.cuh"
+#endif
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -2643,6 +2646,43 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
+    // CUTLASS grouped NVFP4 MoE: at batch > MMVQ_MAX_BATCH_SIZE, bypass the per-expert MMQ/MMF
+    // launch storm and route through the sorted grouped path (below), which runs a single
+    // block-scaled FP4 grouped GEMM. Single-token decode (ne2 <= 8) still uses fast mat-vec.
+#ifdef GGML_CUDA_CUTLASS_FP4
+    // The CUTLASS grouped NVFP4 GEMM is OFF by default: benchmarking (2026-06-30) showed it is
+    // ~2x SLOWER than the fork's MMQ NVFP4 kernel for real MoE shapes, because per-expert M
+    // (tokens*top_k/n_experts = 6..128 rows) is far below FP4's 128-row tensor-core tile, and the
+    // per-call bridge overhead (2 stream syncs + ~20 mallocs + separate act-quant/convert) is not
+    // amortized. MMQ is the correct tool for the skinny-M MoE regime. See CUDA-ENGINE-LOG.md.
+    // Opt in for experiments with GGML_CUDA_USE_CUTLASS_MOE=1.
+    static const bool cutlass_moe_enabled = getenv("GGML_CUDA_USE_CUTLASS_MOE") != nullptr;
+    static const bool fcmoe_debug         = getenv("FCMOE_DEBUG") != nullptr;
+    const bool cutlass_moe_eligible =
+        cutlass_moe_enabled &&
+        src0->type == GGML_TYPE_NVFP4 &&
+        ne2 > MMVQ_MAX_BATCH_SIZE &&
+        ggml_cuda_cutlass_moe_nvfp4_supported((int) ne02, (int) ne01, (int) ne00);
+#else
+    const bool cutlass_moe_eligible = false;
+    const bool fcmoe_debug          = false;
+#endif
+
+    if (fcmoe_debug) {
+        // Fire once for the first call, and once for the first LARGE-batch call
+        // (the first call is llama.cpp's tiny warmup eval, not representative).
+        static bool fcmoe_probed = false;
+        static bool fcmoe_big_probed = false;
+        if (!fcmoe_probed || (!fcmoe_big_probed && ne2 > MMVQ_MAX_BATCH_SIZE)) {
+            if (ne2 > MMVQ_MAX_BATCH_SIZE) fcmoe_big_probed = true;
+            fcmoe_probed = true;
+            fprintf(stderr, "[FCMOE] mul_mat_id: type=%s ne2(tok)=%ld ne12=%ld N(ne01)=%ld K(ne00)=%ld E(ne02)=%ld eligible=%d\n",
+                ggml_type_name(src0->type), (long) ne2, (long) ne12,
+                (long) ne01, (long) ne00, (long) ne02, (int) cutlass_moe_eligible);
+            fflush(stderr);
+        }
+    }
+
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
@@ -2661,12 +2701,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
 
-        if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+        if (!cutlass_moe_eligible && ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
 
-        if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+        if (!cutlass_moe_eligible && ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
             return;
         }
@@ -2733,6 +2773,41 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         ne10*ts_src1_sorted, ne_get_rows*ne10*ts_src1_sorted, ne_get_rows*ne10*ts_src1_sorted, stream);
     CUDA_CHECK(cudaGetLastError());
 
+    bool used_cutlass_moe = false;
+#ifdef GGML_CUDA_CUTLASS_FP4
+    // Single grouped block-scaled FP4 GEMM instead of the per-expert launch storm.
+    // src1_sorted: [ne_get_rows, ne00=K] f32 grouped by expert; dst_sorted: [ne_get_rows, ne0=N] f32.
+    {
+        static bool logged_probe = false;
+        if (!logged_probe) {
+            logged_probe = true;
+            GGML_LOG_INFO("%s: MoE probe: src0->type=%s (NVFP4=%d) E=%d N=%d K=%d supported=%d\n",
+                __func__, ggml_type_name(src0->type), (int)(src0->type == GGML_TYPE_NVFP4),
+                (int) ne02, (int) ne01, (int) ne00,
+                ggml_cuda_cutlass_moe_nvfp4_supported((int) ne02, (int) ne01, (int) ne00));
+        }
+    }
+    if (src0->type == GGML_TYPE_NVFP4 &&
+        ggml_cuda_cutlass_moe_nvfp4_supported((int) ne02, (int) ne01, (int) ne00)) {
+        const int rc = ggml_cuda_cutlass_moe_nvfp4(
+            src0->data, (const float *) src1_sorted.ptr, (float *) dst_sorted.ptr,
+            tokens_per_expert.data(), (int) ne02, (int) ne01, (int) ne00,
+            nb01, nb02, stream);
+        used_cutlass_moe = (rc == 0);
+        static bool logged_path = false;
+        if (fcmoe_debug && !logged_path) {
+            logged_path = true;
+            if (rc == 0) {
+                fprintf(stderr, "[FCMOE] CUTLASS grouped FP4 MoE ACTIVE (rc=0)\n");
+            } else {
+                fprintf(stderr, "[FCMOE] cutlass grouped FP4 MoE returned %d; falling back to per-expert\n", rc);
+            }
+            fflush(stderr);
+        }
+    }
+#endif
+
+    if (!used_cutlass_moe) {
     char * src1_data_cur = (char *) src1_sorted.ptr;
     char *  dst_data_cur = (char *)  dst_sorted.ptr;
     for (int64_t i02 = 0; i02 < ne02; ++i02) {
@@ -2781,6 +2856,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         src1_data_cur += src1_slice.nb[2];
         dst_data_cur  +=  dst_slice.nb[2];
     }
+    } // if (!used_cutlass_moe)
 
     get_rows_cuda(dst_sorted.ptr, type_dst_sorted, ids_from_sorted, dst->data, dst->type,
         ne0, ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted,
