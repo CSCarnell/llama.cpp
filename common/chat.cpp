@@ -2885,7 +2885,21 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
         }
         LOG_WRN("%s: unparsed %s output: %s\n", __func__, common_chat_format_name(params.format), effective_input.substr(result.end).c_str());
         LOG_DBG("%s: full %s output triggering error:\n=== BEGIN ===\n%s\n=== END ===\n", __func__, common_chat_format_name(params.format), effective_input.c_str());
-        throw std::runtime_error(std::string("The model produced output that does not match the expected ") + common_chat_format_name(params.format) + " format");
+        // Lenient fallback instead of 500'ing the request and discarding a full
+        // generation. The PEG_NATIVE / tool-call parser rejects output that does
+        // not match its expected tool-call envelope — but for a plain
+        // response_format=json_object request the model output IS the (valid) JSON
+        // the client asked for; it only failed here because --jinja selected a
+        // tool-call format parser for it. Returning the raw output as assistant
+        // content is correct for that case and strictly better than a 500 for any
+        // other (the caller still receives whatever the model produced). This was
+        // the dominant error source on grammar-constrained throughput workloads:
+        // ~60% of real requests 500'd here despite producing usable JSON.
+        LOG_WRN("%s: returning raw output as content (lenient fallback) instead of throwing\n", __func__);
+        common_chat_msg fallback_msg;
+        fallback_msg.role    = "assistant";
+        fallback_msg.content = effective_input;
+        return fallback_msg;
     }
 
     common_chat_msg msg;

@@ -870,6 +870,10 @@ struct server_metrics {
         completion_token_output result;
         int                     prompt_n_tokens = 0;     // snapshot at collection time (exact ctx-limit check)
         bool                    accept_special  = false; // snapshot on main; used for deferred detok on the worker
+        int                     id_task         = -1;    // snapshot of slot.task->id when queued; the worker skips
+                                                         // the job if the slot was released or relaunched onto a
+                                                         // different task in the meantime (prevents use-after-free
+                                                         // of slot.task / generated_text at any slot count)
     };
 
 //
@@ -1799,6 +1803,18 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        // async output: a worker thread may still hold an in-flight job that
+        // dereferences this slot's task / generated_text. Relaunching the slot
+        // resets slot.task (frees the old unique_ptr) and clears generated_text,
+        // so we MUST drain the worker first or it races into freed memory
+        // (the use-after-free segfault observed under sustained slot churn).
+        // This runs on the main task-handler thread where the worker is normally
+        // already idle, so the wait is ~free in the common case.
+        if (async_output) {
+            async_wait_idle();
+            async_apply_releases();
+        }
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -2829,6 +2845,17 @@ private:
                 server_slot * slot = job.slot;
                 if (slot->async_to_release) {
                     continue; // already stopped on an earlier step
+                }
+                // Robustness guard (any slot count): if the slot was released or
+                // relaunched onto a different task since this job was queued, its
+                // task/generated_text have been reset/freed by the main thread.
+                // Dereferencing them in process_token() would be a use-after-free,
+                // so drop the stale job instead. The relaunch path also drains the
+                // worker (async_wait_idle) before resetting slot.task, so in steady
+                // state this never trips — it is a belt-and-suspenders backstop for
+                // the cancel/disconnect/error release paths.
+                if (!slot->is_processing() || !slot->task || slot->task->id != job.id_task) {
+                    continue;
                 }
                 bool cont;
                 try {
@@ -4076,6 +4103,7 @@ private:
                 slot.sampled = result.tok;
                 async_output_job job;
                 job.slot            = &slot;
+                job.id_task         = slot.task->id;          // snapshot: worker skips if slot is relaunched/released
                 job.prompt_n_tokens = slot.prompt.n_tokens(); // snapshot for exact ctx-limit check
                 job.accept_special  = special;                // snapshot for deferred detok
                 job.result          = std::move(result);
