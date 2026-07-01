@@ -3284,14 +3284,33 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         // of the hung server. Reverted to the conservative guard below until that is done.
         // See .frankencoder/engine/CUDA-DEDICATED-ENGINE-PLAN.md (Phase 1 log).
         if (node->op == GGML_OP_MUL_MAT_ID) {
+            // A/B TOGGLE: FC_MMID_GRAPHS=1 keeps graphs ON for the on-device MMQ/MMF/MMVQ mul_mat_id
+            // paths (only disabling for the true generic sync fallback); unset/0 = upstream-conservative
+            // (graphs off for any quantized mul_mat_id with ne2>mmvq_mmid_max). See
+            // [TAG_MUL_MAT_ID_CUDA_GRAPHS] note above. Finding: enabling gave graphs reused~250 but NO
+            // util/throughput change (49% both ways) => graphs are NOT the batch-96 decode bottleneck.
+            static const bool fc_mmid_graphs = []{ const char * e = getenv("FC_MMID_GRAPHS"); return e && atoi(e) == 1; }();
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
             const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
             if (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max) {
-                // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
-                use_cuda_graph = false;
+                bool safe_to_keep = false;
+                if (fc_mmid_graphs) {
+                    const ggml_tensor * mmid_src0 = node->src[0];
+                    const ggml_tensor * mmid_src1 = node->src[1];
+                    const bool mmid_use_mmvq = ggml_is_quantized(mmid_src0->type) &&
+                        node->ne[2] <= MMVQ_MAX_BATCH_SIZE && node->ne[2] <= mmvq_mmid_max;
+                    const bool mmid_use_mmq  = ggml_cuda_should_use_mmq(mmid_src0->type, cc,
+                        mmid_src1->ne[2], /*n_experts=*/mmid_src0->ne[2]);
+                    const bool mmid_use_mmf  = ggml_cuda_should_use_mmf(mmid_src0->type, cc, WARP_SIZE,
+                        mmid_src0->ne, mmid_src0->nb, mmid_src1->ne[2], /*mul_mat_id=*/true);
+                    safe_to_keep = (mmid_use_mmvq || mmid_use_mmq || mmid_use_mmf);
+                }
+                if (!safe_to_keep) {
+                    use_cuda_graph = false;
 #ifndef NDEBUG
-                GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
+                    GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
 #endif
+                }
             }
         }
 
