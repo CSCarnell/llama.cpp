@@ -355,6 +355,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     float max_bias = 0.0f;
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
 
+    // FC: batched-decode vec kernel. Upstream gates the memory-optimal vec kernel to
+    // Q->ne[3]==1 (single sequence). The vec kernel supports the stream/batch dim
+    // (sequence = blockIdx.z / ne02), so for per-seq-KV batched decode (ne[1]==1,
+    // ne[3]=n_seq) route to vec instead of the tile-wasting MMA prefill kernel.
+    // Env toggle for safe A/B. Default off.
+    static const bool fc_fa_vec_batch = [] {
+        const char * e = getenv("FC_FA_VEC_BATCH");
+        return e && atoi(e) != 0;
+    }();
+
     // The effective batch size for the kernel can be increased by gqa_ratio.
     // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
     bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
@@ -457,7 +467,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel) {
             if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
-                if (cc >= GGML_CUDA_CC_ADA_LOVELACE && Q->ne[1] == 1 && Q->ne[3] == 1 && !(gqa_ratio > 4 && K->ne[1] >= 8192)) {
+                if (cc >= GGML_CUDA_CC_ADA_LOVELACE && Q->ne[1] == 1 && (Q->ne[3] == 1 || fc_fa_vec_batch) && !(gqa_ratio > 4 && K->ne[1] >= 8192)) {
                     return BEST_FATTN_KERNEL_VEC;
                 }
             } else {
