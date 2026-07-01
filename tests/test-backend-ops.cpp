@@ -4037,6 +4037,7 @@ struct test_mul_mat : public test_case {
     double max_nmse_err(ggml_backend_t backend) override {
         // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
         if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+            if (getenv("FC_TIGHT_FP4")) { return 1e-9; }
             return 2e-2;
         }
         return max_nmse_err();
@@ -4226,6 +4227,7 @@ struct test_mul_mat_id : public test_case {
     double max_nmse_err(ggml_backend_t backend) override {
         // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
         if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+            if (getenv("FC_TIGHT_FP4")) { return 1e-9; }
             return 2e-2;
         }
         return max_nmse_err();
@@ -8629,6 +8631,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
+    }
+
+
+    // FC-inference: real-size MoE cases (Qwen3-Coder-30B-A3B: 128 experts, 8 used,
+    // K/N = 2048/768). These force the Blackwell mma.sync mxf4nvf4 MMQ path used in
+    // PREFILL, which the small default cases (m<=512, k=256) never reach — they only
+    // exercise mmvq. NVFP4 inference garbles here while MXFP4 (same shapes) stays clean,
+    // so this is the coverage gap that let the NVFP4 MMQ/MMA bug ship. n_tokens>=32 -> MMQ.
+    for (ggml_type type_a : {GGML_TYPE_NVFP4, GGML_TYPE_MXFP4}) {
+        // n_tok>=32 -> MMQ/prefill path; n_tok<=8 -> mmvq/decode path (the token-generation path)
+        for (int64_t n_tok : {1, 2, 4, 8, 32, 64, 128}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, false, 768,  n_tok, 2048)); // ffn gate/up
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, false, 2048, n_tok, 768));  // ffn down
+        }
     }
 
     for (ggml_type type_a : base_types) {
