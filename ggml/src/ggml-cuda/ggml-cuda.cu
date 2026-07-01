@@ -3272,13 +3272,22 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         }
 
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
+        // NOTE (fc-inference investigation): We PROVED the executed MMQ mul_mat_id path has no
+        // host stream sync — the only cudaMemcpyAsync(D2H)+cudaStreamSynchronize lives in the
+        // generic fallback (ggml_cuda_mul_mat_id, ~L2703), which batch-96 NVFP4 MoE does NOT
+        // take (it dispatches to ggml_cuda_mul_mat_q / MMQ and returns at ~L2666). So on paper
+        // relaxing this guard to keep graphs on for the MMQ path is correct. EMPIRICALLY it still
+        // DEADLOCKS batch-96 MoE decode (GPU idle ~5%, CPU hung, no CUDA error) — ruled out:
+        // stream sync (untaken fallback), pool alloc + stream-K (both proven safe in dense MMQ
+        // capture). Remaining suspects unique to mul_mat_id: mm_ids_helper prefix-sum kernel or
+        // cudaGraphInstantiate of the mul_mat_id subgraph. Pinpointing needs a cuda-gdb backtrace
+        // of the hung server. Reverted to the conservative guard below until that is done.
+        // See .frankencoder/engine/CUDA-DEDICATED-ENGINE-PLAN.md (Phase 1 log).
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
             const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
             if (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max) {
                 // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
-                // TODO: figure out a way to enable for larger batch sizes, without hurting performance
-                // ref: https://github.com/ggml-org/llama.cpp/pull/18958
                 use_cuda_graph = false;
 #ifndef NDEBUG
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
