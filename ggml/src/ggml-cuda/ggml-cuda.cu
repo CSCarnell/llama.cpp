@@ -32,6 +32,7 @@
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
+#include "ggml-cuda/mmid.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -85,6 +86,8 @@
 #include <memory>
 #include <mutex>
 #include <cstdarg>
+#include <unordered_map>
+
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -1628,6 +1631,70 @@ static const cublas_force_compute_type & ggml_cuda_cublas_get_force_compute_type
     return compute_type;
 }
 
+static std::atomic<uint64_t> g_fc_rms_fuse_count{0};
+static std::atomic<uint64_t> g_fc_rms_add_fuse_count{0};
+
+static std::atomic<uint64_t> g_fc_ffn_fuse_count{0};
+static std::atomic<uint64_t> g_fc_bias_fuse_count{0};
+
+static bool ggml_cuda_fc_trace_fusion_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_FC_TRACE_FUSION") != nullptr;
+    return enabled;
+}
+
+
+static void ggml_cuda_bf16_src1_cache_clear(ggml_backend_cuda_context & ctx) {
+    for (ggml_backend_cuda_context::bf16_src1_cache_entry & entry : ctx.bf16_src1_cache) {
+        if (entry.data != nullptr) {
+            CUDA_CHECK(cudaFree(entry.data));
+        }
+
+    }
+
+    ctx.bf16_src1_cache.clear();
+}
+
+static nv_bfloat16 * ggml_cuda_bf16_src1_cache_get(
+        ggml_backend_cuda_context & ctx,
+        int                         device,
+        const ggml_tensor *         src1,
+        const float *               src1_ddf_i,
+        int64_t                     src1_ncols,
+        int64_t                     ne10,
+        cudaStream_t                stream) {
+    static const bool enabled = getenv("GGML_CUDA_BF16_SRC1_CACHE") != nullptr;
+    if (!enabled || !ctx.bf16_src1_cache_active || src1->type == GGML_TYPE_BF16) {
+        return nullptr;
+    }
+
+    for (ggml_backend_cuda_context::bf16_src1_cache_entry & entry : ctx.bf16_src1_cache) {
+        if (entry.device == device && entry.tensor == src1 && entry.device_ptr == src1_ddf_i &&
+            entry.ncols == src1_ncols && entry.nrows == ne10) {
+            return (nv_bfloat16 *) entry.data;
+        }
+    }
+
+    const to_bf16_cuda_t to_bf16_cuda = ggml_get_to_bf16_cuda(src1->type);
+    GGML_ASSERT(to_bf16_cuda != nullptr);
+
+    const size_t ne = src1_ncols*ne10;
+    ggml_backend_cuda_context::bf16_src1_cache_entry entry;
+    entry.device     = device;
+    entry.tensor     = src1;
+    entry.device_ptr = src1_ddf_i;
+    entry.ncols      = src1_ncols;
+    entry.nrows      = ne10;
+    entry.actual_size = ne*sizeof(nv_bfloat16);
+    CUDA_CHECK(cudaMalloc(&entry.data, entry.actual_size));
+
+    to_bf16_cuda(src1_ddf_i, (nv_bfloat16 *) entry.data, ne, stream);
+
+
+    ctx.bf16_src1_cache.push_back(entry);
+    return (nv_bfloat16 *) ctx.bf16_src1_cache.back().data;
+}
+
+
 static void ggml_cuda_op_mul_mat_cublas(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
@@ -1665,15 +1732,19 @@ static void ggml_cuda_op_mul_mat_cublas(
 
     if (supports_bf16 && src0->type == GGML_TYPE_BF16 && ggml_is_contiguous(src0) && row_diff == src0->ne[1]) {
         ggml_cuda_pool_alloc<nv_bfloat16> src1_as_bf16(ctx.pool(id));
-        if (src1->type != GGML_TYPE_BF16) {
+        nv_bfloat16 * src1_cached_bf16 = ggml_cuda_bf16_src1_cache_get(ctx, id, src1, src1_ddf_i, src1_ncols, ne10, stream);
+        if (src1->type != GGML_TYPE_BF16 && src1_cached_bf16 == nullptr) {
             const to_bf16_cuda_t to_bf16_cuda = ggml_get_to_bf16_cuda(src1->type);
             GGML_ASSERT(to_bf16_cuda != nullptr);
             size_t ne = src1_ncols*ne10;
             src1_as_bf16.alloc(ne);
             to_bf16_cuda(src1_ddf_i, src1_as_bf16.get(), ne, stream);
         }
-        const nv_bfloat16 * src1_ptr = src1->type == GGML_TYPE_BF16 ? (const nv_bfloat16 *) src1_ddf_i : src1_as_bf16.get();
+        const nv_bfloat16 * src1_ptr = src1->type == GGML_TYPE_BF16 ? (const nv_bfloat16 *) src1_ddf_i :
+                                      src1_cached_bf16 != nullptr ? src1_cached_bf16 : src1_as_bf16.get();
+
         const nv_bfloat16 * src0_ptr = (const nv_bfloat16 *)src0_dd_i;
+
 
         const float alpha_f32 = 1.0f;
         const float beta_f32  = 0.0f;
@@ -2495,7 +2566,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
         src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 
     const int cc      = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    use_mul_mat_vec_f = use_mul_mat_vec_f && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, is_mul_mat_id ? src1->ne[2] : src1->ne[1]);
+    static const bool force_multi_col_ffn_mmvf = getenv("GGML_CUDA_FORCE_MULTI_COL_FFN_MMVF") != nullptr;
+    const int64_t ncols_dst = is_mul_mat_id ? dst->ne[2] : dst->ne[1];
+    use_mul_mat_vec_f = use_mul_mat_vec_f && (force_multi_col_ffn_mmvf || ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ncols_dst));
 
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft) ||
                        ggml_backend_buft_is_cuda_split(src1->buffer->buft);
@@ -2505,17 +2578,20 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
         return false;
     }
 
-    //we only support fusion for ncols_dst = 1
-    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
+    // Multi-column FFN MMVF fusion is experimental; default behavior preserves the original ncols_dst=1 limit.
+    if (!force_multi_col_ffn_mmvf) {
+        if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
+            return false;
+        }
+        if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] != 1) {
+            return false;
+        }
+    } else if (ncols_dst > 8) {
         return false;
     }
-
-    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] != 1) {
-        return false;
-    }
-
 
     return use_mul_mat_vec_f;
+
 }
 
 static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
@@ -2715,6 +2791,61 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 }
             }
         }
+
+#ifdef GGML_CUDA_CUTLASS_FP4
+        // ZERO-SYNC CUTLASS prefill path (2026-07-02): device-built group args, fused
+        // gather+quant and scatter+rescale, persistent scratch. Opt-in via env until validated.
+        static const bool cutlass_prefill_enabled = getenv("GGML_CUDA_CUTLASS_MOE_PREFILL") != nullptr;
+        // Minimum tokens for the grouped GEMM to win over MMQ: below this, per-expert
+        // M (ne2*top_k/E) sits far under the 128-row FP4 tensor-core tile and MMQ is
+        // faster (measured 2026-06-30). 1024 tokens @ top_k=8, E=128 -> Me ~ 64.
+        static const int cutlass_prefill_min_tokens = [] {
+            const char * s = getenv("GGML_CUDA_CUTLASS_MOE_PREFILL_MIN");
+            return s ? atoi(s) : 1024;
+        }();
+        if (cutlass_prefill_enabled &&
+            src0->type == GGML_TYPE_NVFP4 &&
+            ne2 >= cutlass_prefill_min_tokens && ne13 == 1 &&
+            ggml_cuda_cutlass_moe_nvfp4_supported((int) ne02, (int) ne01, (int) ne00)) {
+
+            cudaStream_t stream = ctx.stream();
+            const int64_t n_expert_used = ids->ne[0];
+            const int64_t ne_get_rows   = ne12 * n_expert_used;
+
+            ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
+            ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
+            ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
+
+            GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
+            const int si1  = ids->nb[1] / ggml_element_size(ids);
+            const int sis1 = nb12 / nb11;
+            ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data,
+                ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+                ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
+            CUDA_CHECK(cudaGetLastError());
+
+            const int64_t s11 = nb11 / ggml_type_size(src1->type);
+            const int64_t s1  = nb1  / ggml_type_size(dst->type);
+            const int rc = ggml_cuda_cutlass_moe_nvfp4_prefill(
+                src0->data, (const float *) src1->data,
+                ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+                (float *) dst->data,
+                (int) ne02, (int) ne01, (int) ne00, (int) ne_get_rows,
+                s11, s1, nb01, nb02, stream);
+            CUDA_CHECK(cudaGetLastError());
+            if (rc == 0) {
+                if (fcmoe_debug) {
+                    static bool once = false;
+                    if (!once) { once = true; fprintf(stderr, "[FCMOE] ZERO-SYNC CUTLASS prefill ACTIVE\n"); fflush(stderr); }
+                }
+                return;
+            }
+            if (fcmoe_debug) {
+                fprintf(stderr, "[FCMOE] zero-sync prefill rejected rc=%d, falling through\n", rc);
+                fflush(stderr);
+            }
+        }
+#endif // GGML_CUDA_CUTLASS_FP4
 
         if (!cutlass_moe_eligible && ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
@@ -4218,8 +4349,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.gate_bias = gate_bias_tensor;
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
 
+                if (ggml_cuda_fc_trace_fusion_enabled()) {
+                    g_fc_ffn_fuse_count.fetch_add(1, std::memory_order_relaxed);
+                }
                 ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
-                fused_mul_mat_vec = true;
+
                 fused_node_count  = 5;
                 break;
             }
@@ -4257,8 +4391,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.gate   = gate->src[0];
                 fusion_data.glu_op = ggml_get_glu_op(glu);
 
+                if (ggml_cuda_fc_trace_fusion_enabled()) {
+                    g_fc_ffn_fuse_count.fetch_add(1, std::memory_order_relaxed);
+                }
                 ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
-                fused_mul_mat_vec = true;
+
                 fused_node_count  = 3;
                 break;
             }
@@ -4345,11 +4482,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
+        if (ggml_cuda_fc_trace_fusion_enabled()) {
+            g_fc_rms_add_fuse_count.fetch_add(1, std::memory_order_relaxed);
+        }
+
         ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+        if (ggml_cuda_fc_trace_fusion_enabled()) {
+            g_fc_rms_fuse_count.fetch_add(1, std::memory_order_relaxed);
+        }
+
         ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
     }
@@ -4386,6 +4531,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
+    ggml_cuda_bf16_src1_cache_clear(*cuda_ctx);
+    cuda_ctx->bf16_src1_cache_active = !use_cuda_graph;
+
 
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
@@ -4596,6 +4744,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         graph_evaluated_or_captured = true;
 #endif  // USE_CUDA_GRAPH
     }
+
+    if (ggml_cuda_fc_trace_fusion_enabled()) {
+        fprintf(stderr, "[FCFUSE] rms_norm_mul=%llu rms_norm_mul_add=%llu ffn_glu_mmv=%llu bias_mmv=%llu\n",
+                (unsigned long long) g_fc_rms_fuse_count.load(std::memory_order_relaxed),
+                (unsigned long long) g_fc_rms_add_fuse_count.load(std::memory_order_relaxed),
+                (unsigned long long) g_fc_ffn_fuse_count.load(std::memory_order_relaxed),
+                (unsigned long long) g_fc_bias_fuse_count.load(std::memory_order_relaxed));
+    }
+
+    cuda_ctx->bf16_src1_cache_active = false;
+    ggml_cuda_bf16_src1_cache_clear(*cuda_ctx);
 }
 
 #ifdef USE_CUDA_GRAPH

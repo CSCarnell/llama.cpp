@@ -1398,6 +1398,23 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+
+    struct bf16_src1_cache_entry {
+        int device = -1;
+        const ggml_tensor * tensor = nullptr;
+
+        const void * device_ptr = nullptr;
+
+        int64_t ncols = 0;
+        int64_t nrows = 0;
+        void * data = nullptr;
+        size_t actual_size = 0;
+    };
+
+    std::vector<bf16_src1_cache_entry> bf16_src1_cache;
+
+    bool bf16_src1_cache_active = false;
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)

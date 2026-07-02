@@ -33,6 +33,23 @@ int ggml_cuda_cutlass_moe_nvfp4(
 // given shape is supported (N,K multiples of 64, sm120+). Cheap; no allocation.
 int ggml_cuda_cutlass_moe_nvfp4_supported(int E, int N, int K);
 
+// ZERO-SYNC prefill path (2026-07-02). Fully stream-ordered: no host syncs, no
+// per-call cudaMalloc (persistent grow-only scratch), no src1 materialization.
+// Hooks the mmq.cu mul_mat_id path using its device-side routing arrays:
+//   src1          : UNSORTED f32 activations (gathered internally via ids_src1)
+//   ids_src1      : [Mtot] compact row -> src1 column index (from mm_ids_helper)
+//   ids_dst       : [Mtot] compact row -> dst column index
+//   expert_bounds : [E+1] compact-row bounds per expert
+//   dst           : f32 output, written as dst[ids_dst[m]*s1 + n]
+//   Mtot          : total compact rows (ne12 * n_expert_used)
+//   s11 / s1      : src1 / dst column strides (elements)
+// Returns 0 on success; non-zero -> caller must run the MMQ path instead.
+int ggml_cuda_cutlass_moe_nvfp4_prefill(
+    const void * w_blocks, const float * src1, const int32_t * ids_src1,
+    const int32_t * ids_dst, const int32_t * expert_bounds, float * dst,
+    int E, int N, int K, int Mtot, int64_t s11, int64_t s1,
+    size_t nb01, size_t nb02, cudaStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

@@ -234,3 +234,162 @@ extern "C" int ggml_cuda_cutlass_moe_nvfp4(
 
     return rc;
 }
+
+// ============================================================================
+// ZERO-SYNC prefill path (2026-07-02)
+// All group arguments built ON DEVICE from expert_bounds; host_problem_shapes
+// = nullptr (same technique as vLLM's cutlass_moe_mm). No host syncs, no
+// per-call cudaMalloc: persistent grow-only scratch. Empty experts get Me=0
+// problem shapes, which the group scheduler skips.
+// ============================================================================
+
+// one thread per expert: fill grouped-GEMM argument arrays from device bounds
+__global__ void k_build_group_args(
+        const int32_t * __restrict__ expert_bounds, const int32_t * __restrict__ sf_offsets,
+        const uint8_t * wB, const uint8_t * wSFB,
+        const uint8_t * dAq, const uint8_t * dSFA, ElementD * dD,
+        typename ProblemShape::UnderlyingProblemShape * ps,
+        const ElementAData ** pA, const ElementBData ** pB,
+        const ElementC ** pC, ElementD ** pD,
+        const ElementSF ** pSFA, const ElementSF ** pSFB,
+        StrideA * sa, StrideB * sb, StrideC * sc, StrideD * sd,
+        LayoutSFA * la, LayoutSFB * lb,
+        int E, int N, int K) {
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= E) return;
+    const int off = expert_bounds[e];
+    const int Me  = expert_bounds[e + 1] - off;
+    ps[e]   = {Me, N, K};
+    pA[e]   = reinterpret_cast<const ElementAData *>(dAq + (size_t) off * (K / 2));
+    pB[e]   = reinterpret_cast<const ElementBData *>(wB + (size_t) e * N * (K / 2));
+    pC[e]   = nullptr;
+    pD[e]   = dD + (size_t) off * N;
+    pSFA[e] = reinterpret_cast<const ElementSF *>(dSFA + (size_t) sf_offsets[e] * (K / QSUB));
+    pSFB[e] = reinterpret_cast<const ElementSF *>(wSFB + (size_t) e * N * (K / QSUB));
+    sa[e]   = cutlass::make_cute_packed_stride(StrideA{}, {Me, K, 1});
+    sb[e]   = cutlass::make_cute_packed_stride(StrideB{}, {N,  K, 1});
+    sc[e]   = cutlass::make_cute_packed_stride(StrideC{}, {Me, N, 1});
+    sd[e]   = cutlass::make_cute_packed_stride(StrideD{}, {Me, N, 1});
+    la[e]   = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(Me, N, K, 1));
+    lb[e]   = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(Me, N, K, 1));
+}
+
+// persistent grow-only scratch (single device assumed; guarded by mutex)
+struct PrefillScratch {
+    // per-expert argument arrays (sized E; realloc only if E grows)
+    void * args_blob = nullptr;   // single allocation carved into the arrays below
+    int    E_cap     = 0;
+    typename ProblemShape::UnderlyingProblemShape * ps = nullptr;
+    const ElementAData ** pA = nullptr; const ElementBData ** pB = nullptr;
+    const ElementC ** pC = nullptr; ElementD ** pD = nullptr;
+    const ElementSF ** pSFA = nullptr; const ElementSF ** pSFB = nullptr;
+    StrideA * sa = nullptr; StrideB * sb = nullptr;
+    StrideC * sc = nullptr; StrideD * sd = nullptr;
+    LayoutSFA * la = nullptr; LayoutSFB * lb = nullptr;
+    int32_t * sf_off = nullptr;   // [E]
+    // token-dependent buffers (grow-only)
+    uint8_t  * dAq  = nullptr; size_t aq_cap  = 0;   // Mtot*(K/2)
+    uint8_t  * dSFA = nullptr; size_t sfa_cap = 0;   // sf_rows*(K/QSUB)
+    float    * dG   = nullptr; size_t g_cap   = 0;   // Mtot
+    ElementD * dD   = nullptr; size_t d_cap   = 0;   // Mtot*N
+    void     * ws   = nullptr; size_t ws_cap  = 0;   // GEMM workspace
+};
+static std::mutex g_pf_mtx;
+static PrefillScratch g_pf;
+
+static void * grow(void ** p, size_t * cap, size_t need) {
+    if (need > *cap) {
+        if (*p) cudaFree(*p);
+        size_t sz = need + need / 4;            // 25% headroom to damp regrowth
+        cudaMalloc(p, sz);
+        *cap = sz;
+    }
+    return *p;
+}
+
+extern "C" int ggml_cuda_cutlass_moe_nvfp4_prefill(
+        const void * w_blocks, const float * src1, const int32_t * ids_src1,
+        const int32_t * ids_dst, const int32_t * expert_bounds, float * dst,
+        int E, int N, int K, int Mtot, int64_t s11, int64_t s1,
+        size_t nb01, size_t nb02, cudaStream_t stream) {
+    if (!ggml_cuda_cutlass_moe_nvfp4_supported(E, N, K)) return 1;
+    if (Mtot <= 0 || E > 1024) return 1;
+    if ((size_t) K * sizeof(float) + 128 > 96 * 1024) return 1; // gather kernel smem cap (sm120: 99KB)
+
+    std::lock_guard<std::mutex> lk(g_pf_mtx);
+    const WeightCache & wc = get_repacked_weights(w_blocks, E, N, K, nb01, nb02, stream);
+
+    // ---- scratch (grow-only; steady-state = zero allocations) ----
+    if (E > g_pf.E_cap) {
+        if (g_pf.args_blob) cudaFree(g_pf.args_blob);
+        const size_t per_e =
+            sizeof(typename ProblemShape::UnderlyingProblemShape) +
+            2 * sizeof(void *) + 2 * sizeof(void *) + 2 * sizeof(void *) +
+            sizeof(StrideA) + sizeof(StrideB) + sizeof(StrideC) + sizeof(StrideD) +
+            sizeof(LayoutSFA) + sizeof(LayoutSFB) + sizeof(int32_t);
+        cudaMalloc(&g_pf.args_blob, (per_e + 64) * (size_t) E); // slack for 16B alignment carving
+        uint8_t * base = (uint8_t *) g_pf.args_blob;
+        auto carve = [&](size_t bytes) { void * r = base; base += (bytes + 15) & ~size_t(15); return r; };
+        g_pf.ps   = (typename ProblemShape::UnderlyingProblemShape *) carve(sizeof(*g_pf.ps) * E);
+        g_pf.pA   = (const ElementAData **) carve(sizeof(void *) * E);
+        g_pf.pB   = (const ElementBData **) carve(sizeof(void *) * E);
+        g_pf.pC   = (const ElementC **)     carve(sizeof(void *) * E);
+        g_pf.pD   = (ElementD **)           carve(sizeof(void *) * E);
+        g_pf.pSFA = (const ElementSF **)    carve(sizeof(void *) * E);
+        g_pf.pSFB = (const ElementSF **)    carve(sizeof(void *) * E);
+        g_pf.sa   = (StrideA *)   carve(sizeof(StrideA) * E);
+        g_pf.sb   = (StrideB *)   carve(sizeof(StrideB) * E);
+        g_pf.sc   = (StrideC *)   carve(sizeof(StrideC) * E);
+        g_pf.sd   = (StrideD *)   carve(sizeof(StrideD) * E);
+        g_pf.la   = (LayoutSFA *) carve(sizeof(LayoutSFA) * E);
+        g_pf.lb   = (LayoutSFB *) carve(sizeof(LayoutSFB) * E);
+        g_pf.sf_off = (int32_t *) carve(sizeof(int32_t) * E);
+        g_pf.E_cap = E;
+    }
+    const size_t sf_rows = (size_t) Mtot + 128 * (size_t) E;    // worst-case round-up padding
+    grow((void **) &g_pf.dAq,  &g_pf.aq_cap,  (size_t) Mtot * (K / 2));
+    grow((void **) &g_pf.dSFA, &g_pf.sfa_cap, sf_rows * (K / QSUB));
+    grow((void **) &g_pf.dG,   &g_pf.g_cap,   (size_t) Mtot * sizeof(float));
+    grow((void **) &g_pf.dD,   &g_pf.d_cap,   (size_t) Mtot * N * sizeof(ElementD));
+
+    // ---- device-side prep: sf_offsets -> gather+quant -> group args (no syncs) ----
+    ggml_cuda_nvfp4_sf_offsets(expert_bounds, g_pf.sf_off, E, stream);
+    cudaMemsetAsync(g_pf.dSFA, 0, sf_rows * (K / QSUB), stream);
+    ggml_cuda_nvfp4_gather_quant(src1, ids_src1, expert_bounds, g_pf.sf_off,
+                                 g_pf.dG, g_pf.dAq, g_pf.dSFA, E, Mtot, K, s11, stream);
+    {
+        const int threads = 128;
+        const int blocks = (E + threads - 1) / threads;
+        k_build_group_args<<<blocks, threads, 0, stream>>>(
+            expert_bounds, g_pf.sf_off, (const uint8_t *) wc.dB, (const uint8_t *) wc.dSFB,
+            g_pf.dAq, g_pf.dSFA, g_pf.dD,
+            g_pf.ps, g_pf.pA, g_pf.pB, g_pf.pC, g_pf.pD, g_pf.pSFA, g_pf.pSFB,
+            g_pf.sa, g_pf.sb, g_pf.sc, g_pf.sd, g_pf.la, g_pf.lb, E, N, K);
+    }
+
+    // ---- grouped GEMM, device-side problem shapes (host shapes = nullptr) ----
+    static cutlass::KernelHardwareInfo hw = [] {
+        cutlass::KernelHardwareInfo h; h.device_id = 0;
+        h.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
+        return h;
+    }();
+
+    typename Gemm::Arguments args;
+    args.mode = cutlass::gemm::GemmUniversalMode::kGrouped;
+    args.problem_shape = {E, g_pf.ps, nullptr};
+    args.mainloop = { g_pf.pA, g_pf.sa, g_pf.pB, g_pf.sb, g_pf.pSFA, g_pf.la, g_pf.pSFB, g_pf.lb };
+    decltype(args.epilogue.thread) fusion; fusion.alpha = 1.0f; fusion.beta = 0.0f;
+    args.epilogue = { fusion, g_pf.pC, g_pf.sc, g_pf.pD, g_pf.sd };
+    args.hw_info = hw;
+
+    Gemm gemm;
+    const size_t wssz = Gemm::get_workspace_size(args);
+    grow(&g_pf.ws, &g_pf.ws_cap, wssz ? wssz : 1);
+    if (gemm.can_implement(args) != cutlass::Status::kSuccess) return 2;
+    if (gemm.initialize(args, g_pf.ws, stream) != cutlass::Status::kSuccess) return 3;
+    if (gemm.run(stream) != cutlass::Status::kSuccess) return 4;
+
+    // ---- fused scatter + rescale + bf16->f32 straight into unsorted dst ----
+    ggml_cuda_nvfp4_scatter_rowscaled(g_pf.dD, g_pf.dG, ids_dst, dst, Mtot, N, s1, stream);
+    return 0;
+}

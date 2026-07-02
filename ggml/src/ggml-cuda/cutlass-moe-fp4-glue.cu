@@ -250,3 +250,181 @@ extern "C" void ggml_cuda_bf16_to_f32_rowscaled(
     k_bf16_to_f32_rowscaled<<<(unsigned)blocks, threads, 0, stream>>>(
         (const uint16_t *)src_bf16, dst, row_scale, M, N);
 }
+
+// ============================================================================
+// zero-sync prefill path (2026-07-02)
+// ============================================================================
+
+// sf_offsets[e] = sum_{j<e} round_up(Me_j, 128), from expert_bounds, on device.
+// E <= 1024 assumed (single block scan; E is 128 for Qwen3-MoE).
+__global__ void k_sf_offsets(const int32_t * expert_bounds, int32_t * sf_offsets, int E) {
+    __shared__ int32_t vals[1024];
+    const int e = threadIdx.x;
+    if (e < E) {
+        const int me = expert_bounds[e + 1] - expert_bounds[e];
+        vals[e] = ((me + 127) / 128) * 128;
+    }
+    __syncthreads();
+    if (e == 0) {
+        int32_t acc = 0;
+        for (int j = 0; j < E; ++j) { sf_offsets[j] = acc; acc += vals[j]; }
+    }
+}
+
+extern "C" void ggml_cuda_nvfp4_sf_offsets(
+        const int32_t * expert_bounds, int32_t * sf_offsets, int E, cudaStream_t stream) {
+    k_sf_offsets<<<1, (E + 31) / 32 * 32, 0, stream>>>(expert_bounds, sf_offsets, E);
+}
+
+// Fused gather + row-amax + quantize. One CUDA block per compact row m:
+//   pass 1: block-stride load of src1 row via ids_src1[m], cache in smem, reduce amax
+//   pass 2: quantize cached row (16-elem sub-blocks per thread) in the a/g domain
+// Binary-search expert id from expert_bounds (E small, log2(128)=7 steps).
+__global__ void k_gather_quant(
+        const float * __restrict__ src1, const int32_t * __restrict__ ids_src1,
+        const int32_t * __restrict__ expert_bounds, const int32_t * __restrict__ sf_offsets,
+        float * __restrict__ row_scale, uint8_t * __restrict__ a_e2m1, uint8_t * __restrict__ sfa,
+        int E, int Mtot, int K, int64_t s11, int numKTiles) {
+    const int m = blockIdx.x;
+    if (m >= Mtot) return;
+
+    extern __shared__ float srow[];               // K floats + 32 reduce slots
+    float * red = srow + K;
+
+    const float * xrow = src1 + (int64_t) ids_src1[m] * s11;
+
+    // pass 1: gather + amax (vectorized float4; K % 64 == 0 guaranteed by caller,
+    // but xrow alignment depends on s11 — fall back to scalar if not 16B-aligned)
+    float amax = 0.f;
+    if (((uintptr_t) xrow & 15) == 0) {
+        const float4 * x4 = (const float4 *) xrow;
+        float4 * s4 = (float4 *) srow;
+        for (int k = threadIdx.x; k < K / 4; k += blockDim.x) {
+            const float4 v = x4[k];
+            s4[k] = v;
+            amax = fmaxf(amax, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))));
+        }
+    } else {
+        for (int k = threadIdx.x; k < K; k += blockDim.x) {
+            const float v = xrow[k];
+            srow[k] = v;
+            amax = fmaxf(amax, fabsf(v));
+        }
+    }
+    // block reduce (warp shuffle + smem across warps)
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off));
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = amax;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        const int nwarp = (blockDim.x + 31) >> 5;
+        float a = threadIdx.x < nwarp ? red[threadIdx.x] : 0.f;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, off));
+        if (threadIdx.x == 0) red[0] = a;
+    }
+    __syncthreads();
+    const float g = red[0] > 0.f ? red[0] / 2688.0f : 1.0f;
+    if (threadIdx.x == 0) row_scale[m] = g;
+    const float invg = 1.0f / g;
+
+    // expert id for row m: binary search in expert_bounds
+    int lo = 0, hi = E - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (expert_bounds[mid] <= m) lo = mid; else hi = mid - 1;
+    }
+    const int e = lo;
+    const int r = m - expert_bounds[e];
+    uint8_t * sfa_e   = sfa + (size_t) sf_offsets[e] * (K / QK_NVFP4_SUB);
+    uint8_t * out_row = a_e2m1 + (size_t) m * (K / 2);
+
+    // pass 2: quantize sub-blocks of 16
+    const int nsubK = K / QK_NVFP4_SUB;
+    for (int gsub = threadIdx.x; gsub < nsubK; gsub += blockDim.x) {
+        const float * xb = srow + gsub * QK_NVFP4_SUB;
+        float sub_amax = 0.f;
+#pragma unroll
+        for (int j = 0; j < QK_NVFP4_SUB; j++)
+            sub_amax = fmaxf(sub_amax, fabsf(xb[j] * invg));
+        const uint8_t ue = d_fp32_to_ue4m3(sub_amax / 6.0f);
+        const float scale = d_ue4m3_to_fp32_std(ue);
+        sfa_e[d_sf_swizzle(r, gsub, numKTiles)] = ue;
+        const int out_base = gsub * (QK_NVFP4_SUB / 2);
+        const float invs = invg / scale;   // x * invg / scale in one mul
+#if __CUDA_ARCH__ >= 1200
+        // hardware e2m1 pair convert: byte = cvt(hi)<<4 | cvt(lo)
+#pragma unroll
+        for (int b = 0; b < QK_NVFP4_SUB / 2; b++) {
+            uint32_t byte_;
+            asm volatile("{\n\t.reg .b8 b8;\n\t"
+                         "cvt.rn.satfinite.e2m1x2.f32 b8, %2, %1;\n\t"
+                         "cvt.u32.u8 %0, b8;\n\t}"
+                         : "=r"(byte_)
+                         : "f"(xb[2 * b] * invs), "f"(xb[2 * b + 1] * invs));
+            out_row[out_base + b] = (uint8_t) byte_;
+        }
+#else
+#pragma unroll
+        for (int b = 0; b < QK_NVFP4_SUB / 2; b++) {
+            const uint8_t c0 = d_e2m1_code(xb[2 * b]     * invg, scale);
+            const uint8_t c1 = d_e2m1_code(xb[2 * b + 1] * invg, scale);
+            out_row[out_base + b] = c0 | (c1 << 4);
+        }
+#endif
+    }
+}
+
+extern "C" void ggml_cuda_nvfp4_gather_quant(
+        const float * src1, const int32_t * ids_src1, const int32_t * expert_bounds,
+        const int32_t * sf_offsets, float * row_scale, void * a_e2m1, void * sfa,
+        int E, int Mtot, int K, int64_t s11, cudaStream_t stream) {
+    const int threads = 256;
+    const int numKTiles = (K + 63) / 64;
+    const size_t smem = (size_t) K * sizeof(float) + 32 * sizeof(float);
+    if (smem > 48 * 1024) {
+        cudaFuncSetAttribute(k_gather_quant, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+    }
+    k_gather_quant<<<(unsigned) Mtot, threads, smem, stream>>>(
+        src1, ids_src1, expert_bounds, sf_offsets, row_scale,
+        (uint8_t *) a_e2m1, (uint8_t *) sfa, E, Mtot, K, s11, numKTiles);
+}
+
+// scatter + rescale + bf16->f32: one block per compact row, vectorized 4-wide.
+// N % 4 == 0 always holds here (N is a multiple of 128 per _supported()).
+__global__ void k_scatter_rowscaled(
+        const uint16_t * __restrict__ src, const float * __restrict__ row_scale,
+        const int32_t * __restrict__ ids_dst, float * __restrict__ dst,
+        int Mtot, int N, int64_t s1) {
+    const int m = blockIdx.x;
+    if (m >= Mtot) return;
+    const float g = row_scale[m];
+    const ushort4 * s4 = (const ushort4 *) (src + (size_t) m * N);
+    float * drow = dst + (int64_t) ids_dst[m] * s1;
+    const bool aligned = ((uintptr_t) drow & 15) == 0;
+    for (int n4 = threadIdx.x; n4 < N / 4; n4 += blockDim.x) {
+        const ushort4 v = s4[n4];
+        float4 f;
+        uint32_t b;
+        b = (uint32_t) v.x << 16; memcpy(&f.x, &b, 4); f.x *= g;
+        b = (uint32_t) v.y << 16; memcpy(&f.y, &b, 4); f.y *= g;
+        b = (uint32_t) v.z << 16; memcpy(&f.z, &b, 4); f.z *= g;
+        b = (uint32_t) v.w << 16; memcpy(&f.w, &b, 4); f.w *= g;
+        if (aligned) {
+            ((float4 *) drow)[n4] = f;
+        } else {
+            drow[n4 * 4 + 0] = f.x; drow[n4 * 4 + 1] = f.y;
+            drow[n4 * 4 + 2] = f.z; drow[n4 * 4 + 3] = f.w;
+        }
+    }
+}
+
+extern "C" void ggml_cuda_nvfp4_scatter_rowscaled(
+        const void * d_bf16, const float * row_scale, const int32_t * ids_dst,
+        float * dst, int Mtot, int N, int64_t s1, cudaStream_t stream) {
+    const int threads = 256;
+    k_scatter_rowscaled<<<(unsigned) Mtot, threads, 0, stream>>>(
+        (const uint16_t *) d_bf16, row_scale, ids_dst, dst, Mtot, N, s1);
+}

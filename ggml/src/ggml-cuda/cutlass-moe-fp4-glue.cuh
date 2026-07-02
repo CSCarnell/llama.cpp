@@ -47,6 +47,33 @@ void ggml_cuda_nvfp4_quant_acts(
 void ggml_cuda_bf16_to_f32_buf(const void * src_bf16, float * dst,
                                int64_t n, cudaStream_t stream);
 
+// ---- zero-sync prefill path (2026-07-02) ----
+// sf_offsets[e] = prefix sum of round_up(Me,128) computed ON DEVICE from
+// expert_bounds (no host sync). sf_offsets has E entries.
+void ggml_cuda_nvfp4_sf_offsets(const int32_t * expert_bounds, int32_t * sf_offsets,
+                                int E, cudaStream_t stream);
+
+// Fused gather + per-row global scale + NVFP4 quantize, one pass, reading the
+// UNSORTED src1 directly through ids_src1 (the mm_ids_helper gather map).
+// Replaces get_rows + act_row_scale + quant_acts (3 kernels, 2 extra passes).
+//   src1        : f32 activations, column i at byte offset i*s11*4
+//   ids_src1    : [Mtot] device gather map (compact row m -> src1 column)
+//   expert_bounds: [E+1] device compact-row bounds per expert
+//   sf_offsets  : [E] device (from ggml_cuda_nvfp4_sf_offsets)
+//   row_scale   : out [Mtot] f32 g[m]
+//   a_e2m1      : out [Mtot, K/2] u8
+//   sfa         : out swizzled ue4m3 (per-expert base sf_offsets[e]*(K/16))
+// K must be <= 12288 (row cached in dynamic shared memory).
+void ggml_cuda_nvfp4_gather_quant(
+    const float * src1, const int32_t * ids_src1, const int32_t * expert_bounds,
+    const int32_t * sf_offsets, float * row_scale, void * a_e2m1, void * sfa,
+    int E, int Mtot, int K, int64_t s11, cudaStream_t stream);
+
+// Fused scatter + rescale + bf16->f32: dst[ids_dst[m]*s1 + n] = bf16(D[m,n]) * g[m].
+void ggml_cuda_nvfp4_scatter_rowscaled(
+    const void * d_bf16, const float * row_scale, const int32_t * ids_dst,
+    float * dst, int Mtot, int N, int64_t s1, cudaStream_t stream);
+
 // bf16 -> f32 with per-row rescale: dst[m,n] = bf16(src[m,n]) * row_scale[m].
 // Undoes the per-row global activation scale folded into the GEMM inputs.
 void ggml_cuda_bf16_to_f32_rowscaled(const void * src_bf16, float * dst,
