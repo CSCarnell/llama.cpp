@@ -758,14 +758,6 @@ static void llama_sampler_chain_backend_apply(
 
         if (smpl.ptr->iface->backend_apply) {
             smpl.ptr->iface->backend_apply(smpl.ptr, ctx, gf, data);
-            if (data->sampled != nullptr) {
-                // A backend sampler has selected the token; downstream CPU code returns
-                // it directly, so avoid materializing/copying full logits/probs/candidates.
-                data->logits = nullptr;
-                data->probs = nullptr;
-                data->candidates = nullptr;
-                break;
-            }
         }
     }
 }
@@ -996,11 +988,6 @@ static void llama_sampler_greedy_backend_apply(
         struct llama_sampler_data * data) {
     GGML_UNUSED(gf);
     GGML_UNUSED(smpl);
-
-    if (data->candidates && data->candidates->ne[0] == 1) {
-        data->sampled = data->candidates;
-        return;
-    }
 
     struct ggml_tensor * curl = ggml_argmax(ctx, data->logits);
     ggml_set_name(curl, "greedy_argmax");
@@ -1838,17 +1825,19 @@ static void llama_sampler_backend_temp_sampling(
         struct llama_sampler_data * data,
         float                       temp) {
     if (temp <= 0.0f) {
-        // Greedy decode only needs the selected token id. Mark it sampled here
-        // so the backend chain skips later distribution/greedy materialization.
+        // Find the most probable token index.
         struct ggml_tensor * max_idx = ggml_argmax(ctx, data->logits);
         ggml_set_name(max_idx, "temp_max_idx");
 
         if (data->candidates) {
             struct ggml_tensor * candidates_rows = ggml_reshape_2d(ctx, data->candidates, 1, data->candidates->ne[0]);
-            data->sampled = ggml_get_rows(ctx, candidates_rows, max_idx);
+            data->candidates = ggml_get_rows(ctx, candidates_rows, max_idx);
         } else {
-            data->sampled = max_idx;
+            data->candidates = max_idx;
         }
+
+        struct ggml_tensor * logits_rows = ggml_reshape_2d(ctx, data->logits, 1, data->logits->ne[0]);
+        data->logits = ggml_get_rows(ctx, logits_rows, max_idx);
 
         return;
     }

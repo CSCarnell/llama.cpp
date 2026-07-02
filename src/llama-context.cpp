@@ -682,7 +682,7 @@ void llama_context::sched_reserve() {
 }
 
 void llama_context::synchronize() {
-    if (!sched) {
+    if (!sched || n_queued_tokens == 0) {
         return;
     }
 
