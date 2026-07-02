@@ -3409,7 +3409,7 @@ void llm_graph_context::build_sampling() const {
         }
     }
 
-    // res->t_logits will contain logits for all tokens that want the logits calculated (logits=1 or output=1)
+
     GGML_ASSERT(res->t_logits != nullptr && "missing t_logits tensor");
 
     // add a dummy row of logits
@@ -3463,6 +3463,7 @@ void llm_graph_context::build_sampling() const {
     }
 
     // TODO: Call llama_sampler_accept_ggml after all samplers have been applied.
+
     /*
     for (const auto & [seq_id, sampler] : samplers) {
         if (auto it = res->t_sampled.find(seq_id); it != res->t_sampled.end()) {

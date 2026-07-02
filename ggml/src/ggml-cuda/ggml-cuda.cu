@@ -3582,32 +3582,39 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
         }
         node_idx++;
     } else if (args.delayed_softmax) {
-        if (node_idx - 2 < 0) {
-            return false;
-        }
-        ggml_tensor * probs_reshaped = nodes[node_idx - 2];
+        const ggml_tensor * probs = nodes[node_idx - 1]->src[0];
 
-        // VIEW->ARGSORT
+        // ARGSORT -> VIEW
         if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_VIEW ||
             nodes[node_idx]->src[0] != nodes[node_idx - 1]) {
             return false;
         }
         node_idx++;
 
-        // GET_ROWS
-        if (node_idx >= n_nodes || nodes[node_idx]->src[1] != nodes[node_idx - 1] ||
-                nodes[node_idx]->src[0] != probs_reshaped) {
+        // VIEW -> GET_ROWS from either probs or a reshape/view of probs.
+        if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_GET_ROWS ||
+                nodes[node_idx]->src[1] != nodes[node_idx - 1]) {
+            return false;
+        }
+        const ggml_tensor * get_rows_src = nodes[node_idx]->src[0];
+        if (get_rows_src != probs &&
+                !(get_rows_src->src[0] == probs &&
+                  (get_rows_src->op == GGML_OP_RESHAPE || get_rows_src->op == GGML_OP_VIEW))) {
             return false;
         }
         node_idx++;
 
-        static const std::vector<ggml_op> remaining_ops = { GGML_OP_RESHAPE, GGML_OP_SOFT_MAX, GGML_OP_RESHAPE };
-
-        for (const ggml_op op : remaining_ops) {
-            if (node_idx >= n_nodes || nodes[node_idx]->op != op || nodes[node_idx]->src[0] != nodes[node_idx - 1]) {
-                return false;
+        // Some graphs do top-k on logits and softmax only the selected weights.
+        // Qwen3-MoE has already-softmaxed probs here, so normalization follows directly.
+        if (node_idx + 2 < n_nodes && nodes[node_idx]->op == GGML_OP_RESHAPE &&
+                nodes[node_idx + 1]->op == GGML_OP_SOFT_MAX &&
+                nodes[node_idx + 2]->op == GGML_OP_RESHAPE) {
+            for (int k = 0; k < 3; ++k) {
+                if (nodes[node_idx + k]->src[0] != nodes[node_idx + k - 1]) {
+                    return false;
+                }
             }
-            node_idx++;
+            node_idx += 3;
         }
     }
 
@@ -3953,6 +3960,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             cgraph->nodes[i]->op == GGML_OP_ARGSORT) {
         ggml_cuda_topk_moe_args args;
         const bool              can_fuse = ggml_cuda_topk_moe_fusion(cgraph, i, args);
+
         std::vector<ggml_op>    ops;
 
         if (can_fuse) {
@@ -4000,19 +4008,42 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     return ops.size() - 1;
                 }
             } else if (!args.norm && !args.prob_bias) {
-                //special case gpt-oss, no norm, no bias.
-                ops.insert(ops.end(), { GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS, GGML_OP_RESHAPE,
-                                        GGML_OP_SOFT_MAX, GGML_OP_RESHAPE });
-                weights                     = cgraph->nodes[i + 5];
-                ids                         = cgraph->nodes[i + 1];
-                const ggml_tensor * softmax = cgraph->nodes[i + 4];
+                // delayed-softmax routers either softmax only the selected weights (gpt-oss)
+                // or provide already-softmaxed probabilities directly to GET_ROWS (Qwen3-MoE).
+                const bool selected_softmax = i + 5 < cgraph->n_nodes &&
+                        cgraph->nodes[i + 3]->op == GGML_OP_RESHAPE &&
+                        cgraph->nodes[i + 4]->op == GGML_OP_SOFT_MAX &&
+                        cgraph->nodes[i + 5]->op == GGML_OP_RESHAPE;
 
-                int out_nodes[2] = { i + 1, i + 5 };
-                if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
-                        ggml_cuda_should_use_topk_moe(softmax, logits, weights, ids) &&
-                        ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
-                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
-                    return ops.size() - 1;
+                if (selected_softmax) {
+                    ops.insert(ops.end(), { GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS, GGML_OP_RESHAPE,
+                                            GGML_OP_SOFT_MAX, GGML_OP_RESHAPE });
+                    weights = cgraph->nodes[i + 5];
+                    ids     = cgraph->nodes[i + 1];
+
+                    int out_nodes[2] = { i + 1, i + 5 };
+                    if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
+                            ggml_cuda_should_use_topk_moe(cgraph->nodes[i + 4], weights, logits, ids) &&
+                            ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
+                        ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+                        return ops.size() - 1;
+                    }
+                } else {
+                    static const bool enable_qwen_direct_topk = getenv("GGML_CUDA_ENABLE_QWEN_DIRECT_TOPK_MOE") != nullptr;
+                    if (!enable_qwen_direct_topk) {
+                        return 0;
+                    }
+                    ops.insert(ops.end(), { GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS });
+                    weights = cgraph->nodes[i + 2];
+                    ids     = cgraph->nodes[i + 1];
+
+                    int out_nodes[2] = { i + 1, i + 2 };
+                    if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
+                            ggml_cuda_should_use_topk_moe(logits, weights, logits, ids) &&
+                            ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
+                        ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+                        return ops.size() - 1;
+                    }
                 }
             }
         }

@@ -253,11 +253,31 @@ void ggml_cuda_op_mul_mat_q(
                             || GGML_CUDA_CC_IS_CDNA(cc))
                             && src1_ncols == ne11;
     const mmq_args args = {
-        src0_dd_i, src0->type, (const int *) src1_ddq_i, nullptr, nullptr, dst_dd_i,
-        ne00, row_diff, src1_ncols, stride01, ne11, nrows_dst,
-        1, 1, 0, 0, 0,
-        1, 1, 0, 0, 0,
-        use_stream_k, src1_ncols};
+        /* .x                  = */ src0_dd_i,
+        /* .type_x             = */ src0->type,
+        /* .y                  = */ (const int *) src1_ddq_i,
+        /* .ids_dst            = */ nullptr,
+        /* .expert_bounds      = */ nullptr,
+        /* .dst                = */ dst_dd_i,
+        /* .ncols_x            = */ ne00,
+        /* .nrows_x            = */ row_diff,
+        /* .ncols_dst          = */ src1_ncols,
+        /* .stride_row_x       = */ stride01,
+        /* .ncols_y            = */ ne11,
+        /* .nrows_dst          = */ nrows_dst,
+        /* .nchannels_x        = */ 1,
+        /* .nchannels_y        = */ 1,
+        /* .stride_channel_x   = */ 0,
+        /* .stride_channel_y   = */ 0,
+        /* .stride_channel_dst = */ 0,
+        /* .nsamples_x         = */ 1,
+        /* .nsamples_y         = */ 1,
+        /* .stride_sample_x    = */ 0,
+        /* .stride_sample_y    = */ 0,
+        /* .stride_sample_dst  = */ 0,
+        /* .use_stream_k       = */ use_stream_k,
+        /* .ncols_max          = */ src1_ncols,
+    };
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 

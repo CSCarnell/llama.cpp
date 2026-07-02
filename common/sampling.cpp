@@ -371,6 +371,11 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         if (use_adaptive_p) {
             // only if user explicitly included adaptive-p sampler
             samplers.push_back(llama_sampler_init_adaptive_p(params.adaptive_target, params.adaptive_decay, params.seed));
+        } else if (params.temp <= 0.0f && params.dynatemp_range <= 0.0f) {
+            // Temperature zero is greedy; avoid the distribution sampler's
+            // softmax/cumsum work after the backend argmax has already reduced
+            // the candidates to the maximum-logit token.
+            samplers.push_back(llama_sampler_init_greedy());
         } else {
             // default: sample from distribution
             samplers.push_back(llama_sampler_init_dist(params.seed));

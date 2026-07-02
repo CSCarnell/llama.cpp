@@ -2,6 +2,8 @@
 
 #include "json-schema-to-grammar.h"
 
+#include <algorithm>
+
 namespace server_schema {
 
 //
@@ -533,7 +535,19 @@ task_params eval_llama_cmpl_schema(
             params.sampling.dry_penalty_last_n = n_ctx_slot;
         }
 
-        // if "reasoning_format" is not provided, its handler will not be called, we will need to handle it here
+        if (params.sampling.temp <= 0.0f && params.sampling.dynatemp_range <= 0.0f) {
+            // Greedy decoding does not need probability truncation. Leaving the
+            // default top-k/min-p chain active creates extra backend sampler graph
+            // work in high-concurrency decode.
+            params.sampling.top_k = 0;
+            params.sampling.top_p = 1.0f;
+            params.sampling.min_p = 0.0f;
+            params.sampling.typ_p = 1.0f;
+            params.sampling.backend_sampling = true;
+            params.sampling.samplers = { COMMON_SAMPLER_TYPE_TEMPERATURE };
+        }
+
+        // if "reasoning_format"
         auto reasoning_format = params.chat_parser_params.reasoning_format;
         params.chat_parser_params.reasoning_in_content = params.stream && (reasoning_format == COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY);
     }
