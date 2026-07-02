@@ -2810,34 +2810,36 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             return s ? atoi(s) : 1024;
         }();
         if (cutlass_prefill_enabled &&
-            src0->type == GGML_TYPE_NVFP4 &&
+            (src0->type == GGML_TYPE_NVFP4 || src0->type == GGML_TYPE_F16) &&
             ne2 >= cutlass_prefill_min_tokens && ne13 == 1 &&
-            ggml_cuda_cutlass_moe_nvfp4_supported((int) ne02, (int) ne01, (int) ne00)) {
+            (src0->type == GGML_TYPE_F16 ||
+             ggml_cuda_cutlass_moe_nvfp4_supported((int) ne02, (int) ne01, (int) ne00))) {
 
             cudaStream_t stream = ctx.stream();
             const int64_t n_expert_used = ids->ne[0];
             const int64_t ne_get_rows   = ne12 * n_expert_used;
 
-            ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
-            ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
-            ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
-
             GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
-            const int si1  = ids->nb[1] / ggml_element_size(ids);
-            const int sis1 = nb12 / nb11;
-            ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data,
-                ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-                ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
-            CUDA_CHECK(cudaGetLastError());
+            ggml_cuda_moe_ids_args ids_args = {
+                (const int32_t *) ids->data,
+                (int) ne02, (int) ne12, (int) n_expert_used, (int) ne11,
+                (int) (ids->nb[1] / ggml_element_size(ids)),
+                (int) (nb12 / nb11),
+            };
 
             const int64_t s11 = nb11 / ggml_type_size(src1->type);
             const int64_t s1  = nb1  / ggml_type_size(dst->type);
-            const int rc = ggml_cuda_cutlass_moe_nvfp4_prefill(
-                src0->data, (const float *) src1->data,
-                ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-                (float *) dst->data,
-                (int) ne02, (int) ne01, (int) ne00, (int) ne_get_rows,
-                s11, s1, nb01, nb02, stream);
+            const int rc = src0->type == GGML_TYPE_NVFP4 ?
+                ggml_cuda_cutlass_moe_nvfp4_prefill(
+                    src0->data, (const float *) src1->data, &ids_args,
+                    (float *) dst->data,
+                    (int) ne02, (int) ne01, (int) ne00, (int) ne_get_rows,
+                    s11, s1, nb01, nb02, stream) :
+                ggml_cuda_cutlass_moe_f16_prefill(
+                    src0->data, (const float *) src1->data, &ids_args,
+                    (float *) dst->data,
+                    (int) ne02, (int) ne01, (int) ne00, (int) ne_get_rows,
+                    s11, s1, nb01, nb02, stream);
             CUDA_CHECK(cudaGetLastError());
             if (rc == 0) {
                 if (fcmoe_debug) {

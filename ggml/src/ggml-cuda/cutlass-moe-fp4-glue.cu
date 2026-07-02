@@ -10,6 +10,8 @@
 
 #include "cutlass-moe-fp4-glue.cuh"
 
+#include <cuda_fp16.h>
+
 #define QK_NVFP4      64
 #define QK_NVFP4_SUB  16
 #define NVFP4_NSUB    (QK_NVFP4 / QK_NVFP4_SUB)   // 4
@@ -427,4 +429,66 @@ extern "C" void ggml_cuda_nvfp4_scatter_rowscaled(
     const int threads = 256;
     k_scatter_rowscaled<<<(unsigned) Mtot, threads, 0, stream>>>(
         (const uint16_t *) d_bf16, row_scale, ids_dst, dst, Mtot, N, s1);
+}
+
+// ============================================================================
+// F16 MoE prefill glue (2026-07-02): gather f32->f16, scatter f32->f32
+// ============================================================================
+
+// dst_f16[m,k] = (half) src1[ids_src1[m]*s11 + k]; one block per compact row
+__global__ void k_gather_f32_to_f16(
+        const float * __restrict__ src1, const int32_t * __restrict__ ids_src1,
+        __half * __restrict__ dst, int Mtot, int K, int64_t s11) {
+    const int m = blockIdx.x;
+    if (m >= Mtot) return;
+    const float * xrow = src1 + (int64_t) ids_src1[m] * s11;
+    __half * drow = dst + (size_t) m * K;
+    if ((((uintptr_t) xrow | (uintptr_t) drow) & 15) == 0 && (K & 7) == 0) {
+        const float4 * x4 = (const float4 *) xrow;
+        // 8 halves = 16 bytes per store: process two float4 loads per iter
+        for (int i = threadIdx.x; i < K / 8; i += blockDim.x) {
+            const float4 a = x4[2 * i];
+            const float4 b = x4[2 * i + 1];
+            __half2 h[4] = {
+                __floats2half2_rn(a.x, a.y), __floats2half2_rn(a.z, a.w),
+                __floats2half2_rn(b.x, b.y), __floats2half2_rn(b.z, b.w) };
+            ((uint4 *) drow)[i] = *(const uint4 *) h;
+        }
+    } else {
+        for (int k = threadIdx.x; k < K; k += blockDim.x) {
+            drow[k] = __float2half_rn(xrow[k]);
+        }
+    }
+}
+
+extern "C" void ggml_cuda_moe_gather_f32_to_f16(
+        const float * src1, const int32_t * ids_src1, void * dst_f16,
+        int Mtot, int K, int64_t s11, cudaStream_t stream) {
+    k_gather_f32_to_f16<<<(unsigned) Mtot, 256, 0, stream>>>(
+        src1, ids_src1, (__half *) dst_f16, Mtot, K, s11);
+}
+
+// dst[ids_dst[m]*s1 + n] = src[m*N + n]; one block per compact row, float4
+__global__ void k_scatter_f32(
+        const float * __restrict__ src, const int32_t * __restrict__ ids_dst,
+        float * __restrict__ dst, int Mtot, int N, int64_t s1) {
+    const int m = blockIdx.x;
+    if (m >= Mtot) return;
+    const float * srow = src + (size_t) m * N;
+    float * drow = dst + (int64_t) ids_dst[m] * s1;
+    if ((((uintptr_t) srow | (uintptr_t) drow) & 15) == 0 && (N & 3) == 0) {
+        for (int i = threadIdx.x; i < N / 4; i += blockDim.x) {
+            ((float4 *) drow)[i] = ((const float4 *) srow)[i];
+        }
+    } else {
+        for (int n = threadIdx.x; n < N; n += blockDim.x) {
+            drow[n] = srow[n];
+        }
+    }
+}
+
+extern "C" void ggml_cuda_moe_scatter_f32(
+        const float * src, const int32_t * ids_dst, float * dst,
+        int Mtot, int N, int64_t s1, cudaStream_t stream) {
+    k_scatter_f32<<<(unsigned) Mtot, 256, 0, stream>>>(src, ids_dst, dst, Mtot, N, s1);
 }

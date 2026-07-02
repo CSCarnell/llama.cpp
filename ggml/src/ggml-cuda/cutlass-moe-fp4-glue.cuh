@@ -80,6 +80,17 @@ void ggml_cuda_bf16_to_f32_rowscaled(const void * src_bf16, float * dst,
                                      const float * row_scale, int M, int N,
                                      cudaStream_t stream);
 
+// ---- F16 MoE prefill glue (2026-07-02) ----
+// gather + f32->f16 convert through ids_src1 (one block/row, vectorized)
+void ggml_cuda_moe_gather_f32_to_f16(
+    const float * src1, const int32_t * ids_src1, void * dst_f16,
+    int Mtot, int K, int64_t s11, cudaStream_t stream);
+
+// scatter f32 rows through ids_dst (one block/row, vectorized)
+void ggml_cuda_moe_scatter_f32(
+    const float * src, const int32_t * ids_dst, float * dst,
+    int Mtot, int N, int64_t s1, cudaStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

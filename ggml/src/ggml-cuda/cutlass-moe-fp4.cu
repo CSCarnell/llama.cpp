@@ -2,6 +2,7 @@
 // Reference impl (proven): .frankencoder/engine/fp4moe-port/validate_glue.cu.
 #include "cutlass-moe-fp4.cuh"
 #include "cutlass-moe-fp4-glue.cuh"
+#include "mmid.cuh"
 
 #include <cstdio>
 #include <mutex>
@@ -274,6 +275,64 @@ __global__ void k_build_group_args(
     lb[e]   = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(Me, N, K, 1));
 }
 
+// ---------------------------------------------------------------------------
+// shared routing cache: gate/up/down of one MoE layer call mul_mat_id with the
+// SAME ids tensor -> compute mm_ids_helper once, reuse <=3 times (then forced
+// recompute; the allocator may hand the next layer's ids the same address, so
+// the use cap is the only thing preventing stale-routing poisoning — 3 matches
+// gate/up/down exactly).
+// ---------------------------------------------------------------------------
+struct MoeRouting {
+    int32_t * buf = nullptr; size_t cap = 0;      // holds ids_src1 + ids_dst + bounds
+    int32_t * ids_src1 = nullptr, * ids_dst = nullptr, * bounds = nullptr;
+    const int32_t * key_ids = nullptr;
+    int key_tok = -1, key_neu = -1, key_E = -1;
+    int key_ny = -1, key_sis1 = -1;   // ne11/sis1 CHANGE the ids_src1 gather map:
+                                      // gate/up use ne11=1 (broadcast), down uses
+                                      // ne11=n_expert_used (per-use rows). MUST key.
+    int uses = 0;
+    uint64_t generation = 0;
+};
+static std::mutex g_rt_mtx;
+static MoeRouting g_rt;
+
+// Returns device routing arrays for the given ids args (cached or recomputed).
+extern "C" void ggml_cuda_moe_routing_get(
+        const ggml_cuda_moe_ids_args * a, cudaStream_t stream,
+        const int32_t ** ids_src1, const int32_t ** ids_dst,
+        const int32_t ** bounds, uint64_t * generation) {
+    std::lock_guard<std::mutex> lk(g_rt_mtx);
+    const int Mtot = a->n_tokens * a->n_expert_used;
+    const bool hit = g_rt.key_ids == a->ids_data && g_rt.key_tok == a->n_tokens &&
+                     g_rt.key_neu == a->n_expert_used && g_rt.key_E == a->n_experts &&
+                     g_rt.key_ny == a->nchannels_y && g_rt.key_sis1 == a->sis1 &&
+                     g_rt.uses > 0 && g_rt.uses < 2;   // only gate->up may share (down
+                                                       // differs in ny/sis1); cap=2 so a
+                                                       // reused ids ADDRESS from the next
+                                                       // layer can never serve stale data
+    if (!hit) {
+        const size_t need = ((size_t) Mtot * 2 + a->n_experts + 1) * sizeof(int32_t);
+        if (need > g_rt.cap) {
+            if (g_rt.buf) cudaFree(g_rt.buf);
+            cudaMalloc((void **) &g_rt.buf, need + need / 4);
+            g_rt.cap = need + need / 4;
+        }
+        g_rt.ids_src1 = g_rt.buf;
+        g_rt.ids_dst  = g_rt.buf + Mtot;
+        g_rt.bounds   = g_rt.buf + 2 * (size_t) Mtot;
+        ggml_cuda_launch_mm_ids_helper(a->ids_data, g_rt.ids_src1, g_rt.ids_dst, g_rt.bounds,
+            a->n_experts, a->n_tokens, a->n_expert_used, a->nchannels_y, a->si1, a->sis1, stream);
+        g_rt.key_ids = a->ids_data; g_rt.key_tok = a->n_tokens;
+        g_rt.key_neu = a->n_expert_used; g_rt.key_E = a->n_experts;
+        g_rt.key_ny = a->nchannels_y; g_rt.key_sis1 = a->sis1;
+        g_rt.uses = 0;
+        g_rt.generation++;
+    }
+    g_rt.uses++;
+    *ids_src1 = g_rt.ids_src1; *ids_dst = g_rt.ids_dst;
+    *bounds = g_rt.bounds; *generation = g_rt.generation;
+}
+
 // persistent grow-only scratch (single device assumed; guarded by mutex)
 struct PrefillScratch {
     // per-expert argument arrays (sized E; realloc only if E grows)
@@ -308,13 +367,16 @@ static void * grow(void ** p, size_t * cap, size_t need) {
 }
 
 extern "C" int ggml_cuda_cutlass_moe_nvfp4_prefill(
-        const void * w_blocks, const float * src1, const int32_t * ids_src1,
-        const int32_t * ids_dst, const int32_t * expert_bounds, float * dst,
-        int E, int N, int K, int Mtot, int64_t s11, int64_t s1,
+        const void * w_blocks, const float * src1, const ggml_cuda_moe_ids_args * ids,
+        float * dst, int E, int N, int K, int Mtot, int64_t s11, int64_t s1,
         size_t nb01, size_t nb02, cudaStream_t stream) {
     if (!ggml_cuda_cutlass_moe_nvfp4_supported(E, N, K)) return 1;
     if (Mtot <= 0 || E > 1024) return 1;
     if ((size_t) K * sizeof(float) + 128 > 96 * 1024) return 1; // gather kernel smem cap (sm120: 99KB)
+
+    const int32_t * ids_src1; const int32_t * ids_dst; const int32_t * expert_bounds;
+    uint64_t routing_gen;
+    ggml_cuda_moe_routing_get(ids, stream, &ids_src1, &ids_dst, &expert_bounds, &routing_gen);
 
     std::lock_guard<std::mutex> lk(g_pf_mtx);
     const WeightCache & wc = get_repacked_weights(w_blocks, E, N, K, nb01, nb02, stream);
@@ -353,10 +415,21 @@ extern "C" int ggml_cuda_cutlass_moe_nvfp4_prefill(
     grow((void **) &g_pf.dD,   &g_pf.d_cap,   (size_t) Mtot * N * sizeof(ElementD));
 
     // ---- device-side prep: sf_offsets -> gather+quant -> group args (no syncs) ----
-    ggml_cuda_nvfp4_sf_offsets(expert_bounds, g_pf.sf_off, E, stream);
-    cudaMemsetAsync(g_pf.dSFA, 0, sf_rows * (K / QSUB), stream);
-    ggml_cuda_nvfp4_gather_quant(src1, ids_src1, expert_bounds, g_pf.sf_off,
-                                 g_pf.dG, g_pf.dAq, g_pf.dSFA, E, Mtot, K, s11, stream);
+    // A-operand reuse: gate and up projections of one layer consume the SAME
+    // activations with the SAME routing -> identical quantized A/SFA/G. Skip
+    // the whole quant pass on the second call (measured: k_gather_quant was
+    // ~5-8% of prefill GPU time; this halves it).
+    static const float * s_a_src1 = nullptr;
+    static uint64_t s_a_gen = 0; static int s_a_K = -1, s_a_M = -1;
+    const bool a_reusable = s_a_src1 == src1 && s_a_gen == routing_gen &&
+                            s_a_K == K && s_a_M == Mtot;
+    if (!a_reusable) {
+        ggml_cuda_nvfp4_sf_offsets(expert_bounds, g_pf.sf_off, E, stream);
+        cudaMemsetAsync(g_pf.dSFA, 0, sf_rows * (K / QSUB), stream);
+        ggml_cuda_nvfp4_gather_quant(src1, ids_src1, expert_bounds, g_pf.sf_off,
+                                     g_pf.dG, g_pf.dAq, g_pf.dSFA, E, Mtot, K, s11, stream);
+        s_a_src1 = src1; s_a_gen = routing_gen; s_a_K = K; s_a_M = Mtot;
+    }
     {
         const int threads = 128;
         const int blocks = (E + threads - 1) / threads;

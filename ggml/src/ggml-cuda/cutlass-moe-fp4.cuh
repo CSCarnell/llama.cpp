@@ -44,10 +44,33 @@ int ggml_cuda_cutlass_moe_nvfp4_supported(int E, int N, int K);
 //   Mtot          : total compact rows (ne12 * n_expert_used)
 //   s11 / s1      : src1 / dst column strides (elements)
 // Returns 0 on success; non-zero -> caller must run the MMQ path instead.
+// Routing (mm_ids_helper) now runs INSIDE the bridges and is cached across the
+// gate/up/down calls of one MoE layer (same ids tensor, <=3 uses before forced
+// recompute so allocator buffer-aliasing can never serve stale routing). The
+// gathered+quantized A operand is additionally reused across gate->up (same
+// src1/K). Callers pass the raw ids tensor data + its strides.
+struct ggml_cuda_moe_ids_args {
+    const int32_t * ids_data;   // ids tensor (device)
+    int n_experts;              // ne02
+    int n_tokens;               // ne12
+    int n_expert_used;          // ids->ne[0]
+    int nchannels_y;            // ne11
+    int si1;                    // ids row stride (elements)
+    int sis1;                   // src1 sample stride ratio (nb12/nb11)
+};
+
 int ggml_cuda_cutlass_moe_nvfp4_prefill(
-    const void * w_blocks, const float * src1, const int32_t * ids_src1,
-    const int32_t * ids_dst, const int32_t * expert_bounds, float * dst,
-    int E, int N, int K, int Mtot, int64_t s11, int64_t s1,
+    const void * w_blocks, const float * src1, const ggml_cuda_moe_ids_args * ids,
+    float * dst, int E, int N, int K, int Mtot, int64_t s11, int64_t s1,
+    size_t nb01, size_t nb02, cudaStream_t stream);
+
+// Same zero-sync bridge for GGML_TYPE_F16 experts (cutlass-moe-f16.cu):
+// ONE CUTLASS grouped f16 GEMM (device-side problem sizes) instead of the
+// per-expert cuBLAS storm. Weights used in place (no repack); w_f16 points
+// at the expert tensor, strides nb01/nb02 in bytes. Returns 0 on success.
+int ggml_cuda_cutlass_moe_f16_prefill(
+    const void * w_f16, const float * src1, const ggml_cuda_moe_ids_args * ids,
+    float * dst, int E, int N, int K, int Mtot, int64_t s11, int64_t s1,
     size_t nb01, size_t nb02, cudaStream_t stream);
 
 #ifdef __cplusplus
