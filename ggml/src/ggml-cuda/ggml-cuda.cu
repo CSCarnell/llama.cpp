@@ -2834,12 +2834,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     src0->data, (const float *) src1->data, &ids_args,
                     (float *) dst->data,
                     (int) ne02, (int) ne01, (int) ne00, (int) ne_get_rows,
-                    s11, s1, nb01, nb02, stream) :
+                    s11, s1, nb01, nb02, /*fuse_w=*/nullptr, stream) :
                 ggml_cuda_cutlass_moe_f16_prefill(
                     src0->data, (const float *) src1->data, &ids_args,
                     (float *) dst->data,
                     (int) ne02, (int) ne01, (int) ne00, (int) ne_get_rows,
-                    s11, s1, nb01, nb02, stream);
+                    s11, s1, nb01, nb02, /*fuse_w=*/nullptr, stream);
             CUDA_CHECK(cudaGetLastError());
             if (rc == 0) {
                 if (fcmoe_debug) {
@@ -4099,6 +4099,93 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+#ifdef GGML_CUDA_CUTLASS_FP4
+// Fused MUL_MAT_ID + MUL(routing weights) via the CUTLASS prefill bridge:
+// the routing-weight multiply is applied inside the scatter epilogue (dst row
+// gain *= w[ids_dst[m]]) and the result written directly into the MUL node's
+// output — the separate bin_bcast mul kernel (~7% GPU time @8k) is elided.
+// Matches build_moe_ffn's down-projection: experts = mul_mat_id(down, act);
+// experts = ggml_mul(experts, weights[1, n_expert_used, n_tokens]).
+// ids_dst[m] = it*n_expert_used + iex (see mmid.cu) is exactly the flat index
+// into contiguous weights, so no extra index structures are needed.
+// Returns true when handled; false = fall back to unfused execution.
+static bool ggml_cuda_mul_mat_id_fused_weights(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * mmid, ggml_tensor * mul) {
+    const ggml_tensor * src0 = mmid->src[0];
+    const ggml_tensor * src1 = mmid->src[1];
+    const ggml_tensor * ids  = mmid->src[2];
+    const ggml_tensor * w    = mul->src[1];
+
+    static const bool enabled = getenv("GGML_CUDA_CUTLASS_MOE_PREFILL") != nullptr;
+    static const bool no_fuse = getenv("GGML_CUDA_CUTLASS_MOE_NO_FUSE") != nullptr;
+    static const int min_tokens = [] {
+        const char * s = getenv("GGML_CUDA_CUTLASS_MOE_PREFILL_MIN");
+        return s ? atoi(s) : 1024;
+    }();
+    if (!enabled || no_fuse) {
+        return false;
+    }
+    if (src0->type != GGML_TYPE_NVFP4 && src0->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (src1->type != GGML_TYPE_F32 || mmid->type != GGML_TYPE_F32 ||
+        mul->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (ggml_backend_buft_is_cuda_split(src0->buffer->buft)) {
+        return false;
+    }
+
+    const int64_t n_tokens      = mmid->ne[2];
+    const int64_t n_expert_used = ids->ne[0];
+    if (n_tokens < min_tokens || src1->ne[3] != 1) {
+        return false;
+    }
+    if (src0->type == GGML_TYPE_NVFP4 &&
+        !ggml_cuda_cutlass_moe_nvfp4_supported((int) src0->ne[2], (int) src0->ne[1], (int) src0->ne[0])) {
+        return false;
+    }
+    // weights must be [1, n_expert_used, n_tokens] contiguous, and the MUL output
+    // contiguous, so ids_dst's flat it*n_expert_used+iex indexes both correctly
+    if (w->ne[0] != 1 || w->ne[1] != n_expert_used || w->ne[2] != n_tokens || w->ne[3] != 1) {
+        return false;
+    }
+    if (!ggml_is_contiguous(w) || !ggml_is_contiguous(mul) || mmid->ne[1] != n_expert_used) {
+        return false;
+    }
+    if (ids->nb[0] != ggml_element_size(ids)) {
+        return false;
+    }
+
+    cudaStream_t stream = ctx.stream();
+    ggml_cuda_moe_ids_args ids_args = {
+        (const int32_t *) ids->data,
+        (int) src0->ne[2], (int) n_tokens, (int) n_expert_used, (int) src1->ne[1],
+        (int) (ids->nb[1] / ggml_element_size(ids)),
+        (int) (src1->nb[2] / src1->nb[1]),
+    };
+    const int64_t s11  = src1->nb[1] / ggml_type_size(src1->type);
+    const int64_t s1   = mul->nb[1]  / ggml_type_size(mul->type);
+    const int     Mtot = (int) (n_tokens * n_expert_used);
+
+    const int rc = src0->type == GGML_TYPE_NVFP4 ?
+        ggml_cuda_cutlass_moe_nvfp4_prefill(
+            src0->data, (const float *) src1->data, &ids_args, (float *) mul->data,
+            (int) src0->ne[2], (int) src0->ne[1], (int) src0->ne[0], Mtot,
+            s11, s1, src0->nb[1], src0->nb[2], (const float *) w->data, stream) :
+        ggml_cuda_cutlass_moe_f16_prefill(
+            src0->data, (const float *) src1->data, &ids_args, (float *) mul->data,
+            (int) src0->ne[2], (int) src0->ne[1], (int) src0->ne[0], Mtot,
+            s11, s1, src0->nb[1], src0->nb[2], (const float *) w->data, stream);
+    CUDA_CHECK(cudaGetLastError());
+    if (rc == 0 && getenv("FCMOE_DEBUG")) {
+        static bool once = false;
+        if (!once) { once = true; fprintf(stderr, "[FCMOE] FUSED mul_mat_id+routing-mul ACTIVE\n"); fflush(stderr); }
+    }
+    return rc == 0;
+}
+#endif // GGML_CUDA_CUTLASS_FP4
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4108,6 +4195,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+#ifdef GGML_CUDA_CUTLASS_FP4
+    // MUL_MAT_ID + routing-weight MUL -> CUTLASS bridge with fused scatter epilogue
+    if (node->op == GGML_OP_MUL_MAT_ID && i + 1 < cgraph->n_nodes &&
+        cgraph->nodes[i + 1]->op == GGML_OP_MUL && cgraph->nodes[i + 1]->src[0] == node) {
+        const enum ggml_op mmid_mul_ops[2] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL };
+        if (ggml_can_fuse(cgraph, i, mmid_mul_ops, 2) &&
+            ggml_cuda_mul_mat_id_fused_weights(*cuda_ctx, node, cgraph->nodes[i + 1])) {
+            return 1;
+        }
+    }
+#endif
 
     //topk-moe
     if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||

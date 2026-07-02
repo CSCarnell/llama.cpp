@@ -59,10 +59,14 @@ struct ggml_cuda_moe_ids_args {
     int sis1;                   // src1 sample stride ratio (nb12/nb11)
 };
 
+// fuse_w (optional, may be NULL): routing weights, contiguous [1, n_expert_used,
+// n_tokens] f32 — flat index it*n_expert_used+iex == ids_dst[m]. When set, the
+// graph-level ggml_mul(experts, weights) is fused into the scatter epilogue and
+// dst is the MUL node's output tensor.
 int ggml_cuda_cutlass_moe_nvfp4_prefill(
     const void * w_blocks, const float * src1, const ggml_cuda_moe_ids_args * ids,
     float * dst, int E, int N, int K, int Mtot, int64_t s11, int64_t s1,
-    size_t nb01, size_t nb02, cudaStream_t stream);
+    size_t nb01, size_t nb02, const float * fuse_w, cudaStream_t stream);
 
 // Same zero-sync bridge for GGML_TYPE_F16 experts (cutlass-moe-f16.cu):
 // ONE CUTLASS grouped f16 GEMM (device-side problem sizes) instead of the
@@ -71,7 +75,7 @@ int ggml_cuda_cutlass_moe_nvfp4_prefill(
 int ggml_cuda_cutlass_moe_f16_prefill(
     const void * w_f16, const float * src1, const ggml_cuda_moe_ids_args * ids,
     float * dst, int E, int N, int K, int Mtot, int64_t s11, int64_t s1,
-    size_t nb01, size_t nb02, cudaStream_t stream);
+    size_t nb01, size_t nb02, const float * fuse_w, cudaStream_t stream);
 
 #ifdef __cplusplus
 }

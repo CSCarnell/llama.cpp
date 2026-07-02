@@ -91,7 +91,7 @@ extern "C" void ggml_cuda_moe_routing_get(
 extern "C" int ggml_cuda_cutlass_moe_f16_prefill(
         const void * w_f16, const float * src1, const ggml_cuda_moe_ids_args * ids,
         float * dst, int E, int N, int K, int Mtot, int64_t s11, int64_t s1,
-        size_t nb01, size_t nb02, cudaStream_t stream) {
+        size_t nb01, size_t nb02, const float * fuse_w, cudaStream_t stream) {
     if (E <= 0 || N <= 0 || K <= 0 || Mtot <= 0) return 1;
     if (K % 8 != 0 || N % 4 != 0) return 1;                    // alignment
     if ((nb01 / sizeof(cutlass::half_t)) % 8 != 0) return 1;   // ldb alignment
@@ -162,6 +162,6 @@ extern "C" int ggml_cuda_cutlass_moe_f16_prefill(
     if (gemm.run(stream) != cutlass::Status::kSuccess) return 4;
 
     // ---- scatter f32 rows into unsorted dst ----
-    ggml_cuda_moe_scatter_f32((const float *) g_f16.dD, ids_dst, dst, Mtot, N, s1, stream);
+    ggml_cuda_moe_scatter_f32((const float *) g_f16.dD, ids_dst, dst, Mtot, N, s1, fuse_w, stream);
     return 0;
 }
