@@ -1751,7 +1751,13 @@ static void ggml_cuda_op_mul_mat_cublas(
 
         CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
 
-        static const bool bf16_direct_f32 = getenv("GGML_CUDA_BF16_GEMM_DIRECT_F32") != nullptr;
+        // Direct-F32 output GEMM is the DEFAULT (2026-07-02): writing D as F32
+        // straight from cuBLAS skips the bf16 staging buffer + convert_unary
+        // kernel (was ~8% of dense prefill). Measured +6% pp8192 on Qwen3-4B
+        // BF16 (21.1k -> 22.4k tok/s), byte-identical output (accumulation is
+        // CUBLAS_COMPUTE_32F either way; this only changes the D store type).
+        // Opt out with GGML_CUDA_BF16_GEMM_STAGED=1 if a regression appears.
+        static const bool bf16_direct_f32 = getenv("GGML_CUDA_BF16_GEMM_STAGED") == nullptr;
         if (bf16_direct_f32) {
             CUBLAS_CHECK(
                 cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
