@@ -72,9 +72,12 @@ void ggml_cuda_nvfp4_gather_quant(
 // Fused scatter + rescale + bf16->f32: dst[ids_dst[m]*s1 + n] = bf16(D[m,n]) * g[m].
 // fuse_w (optional, may be NULL): routing weights indexed by ids_dst[m] — fuses
 // the graph-level ggml_mul(experts, weights) into the scatter (dst *= fuse_w).
+// accum_neu > 0: rows are accumulated per TOKEN (dst row = ids_dst[m]/accum_neu,
+// atomicAdd) — fuses the sum-over-experts too. dst must be pre-zeroed.
 void ggml_cuda_nvfp4_scatter_rowscaled(
     const void * d_bf16, const float * row_scale, const int32_t * ids_dst,
-    float * dst, int Mtot, int N, int64_t s1, const float * fuse_w, cudaStream_t stream);
+    float * dst, int Mtot, int N, int64_t s1, const float * fuse_w, int accum_neu,
+    cudaStream_t stream);
 
 // bf16 -> f32 with per-row rescale: dst[m,n] = bf16(src[m,n]) * row_scale[m].
 // Undoes the per-row global activation scale folded into the GEMM inputs.
@@ -91,7 +94,7 @@ void ggml_cuda_moe_gather_f32_to_f16(
 // scatter f32 rows through ids_dst (one block/row, vectorized)
 void ggml_cuda_moe_scatter_f32(
     const float * src, const int32_t * ids_dst, float * dst,
-    int Mtot, int N, int64_t s1, const float * fuse_w, cudaStream_t stream);
+    int Mtot, int N, int64_t s1, const float * fuse_w, int accum_neu, cudaStream_t stream);
 
 #ifdef __cplusplus
 }

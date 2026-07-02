@@ -369,7 +369,7 @@ static void * grow(void ** p, size_t * cap, size_t need) {
 extern "C" int ggml_cuda_cutlass_moe_nvfp4_prefill(
         const void * w_blocks, const float * src1, const ggml_cuda_moe_ids_args * ids,
         float * dst, int E, int N, int K, int Mtot, int64_t s11, int64_t s1,
-        size_t nb01, size_t nb02, const float * fuse_w, cudaStream_t stream) {
+        size_t nb01, size_t nb02, const float * fuse_w, int accum_neu, cudaStream_t stream) {
     if (!ggml_cuda_cutlass_moe_nvfp4_supported(E, N, K)) return 1;
     if (Mtot <= 0 || E > 1024) return 1;
     if ((size_t) K * sizeof(float) + 128 > 96 * 1024) return 1; // gather kernel smem cap (sm120: 99KB)
@@ -463,6 +463,9 @@ extern "C" int ggml_cuda_cutlass_moe_nvfp4_prefill(
     if (gemm.run(stream) != cutlass::Status::kSuccess) return 4;
 
     // ---- fused scatter + rescale + bf16->f32 straight into unsorted dst ----
-    ggml_cuda_nvfp4_scatter_rowscaled(g_pf.dD, g_pf.dG, ids_dst, dst, Mtot, N, s1, fuse_w, stream);
+    if (accum_neu > 0) {
+        cudaMemsetAsync(dst, 0, (size_t) (Mtot / accum_neu) * s1 * sizeof(float), stream);
+    }
+    ggml_cuda_nvfp4_scatter_rowscaled(g_pf.dD, g_pf.dG, ids_dst, dst, Mtot, N, s1, fuse_w, accum_neu, stream);
     return 0;
 }

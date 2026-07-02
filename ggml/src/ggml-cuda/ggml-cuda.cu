@@ -2834,12 +2834,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     src0->data, (const float *) src1->data, &ids_args,
                     (float *) dst->data,
                     (int) ne02, (int) ne01, (int) ne00, (int) ne_get_rows,
-                    s11, s1, nb01, nb02, /*fuse_w=*/nullptr, stream) :
+                    s11, s1, nb01, nb02, /*fuse_w=*/nullptr, /*accum_neu=*/0, stream) :
                 ggml_cuda_cutlass_moe_f16_prefill(
                     src0->data, (const float *) src1->data, &ids_args,
                     (float *) dst->data,
                     (int) ne02, (int) ne01, (int) ne00, (int) ne_get_rows,
-                    s11, s1, nb01, nb02, /*fuse_w=*/nullptr, stream);
+                    s11, s1, nb01, nb02, /*fuse_w=*/nullptr, /*accum_neu=*/0, stream);
             CUDA_CHECK(cudaGetLastError());
             if (rc == 0) {
                 if (fcmoe_debug) {
@@ -4108,9 +4108,12 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 // experts = ggml_mul(experts, weights[1, n_expert_used, n_tokens]).
 // ids_dst[m] = it*n_expert_used + iex (see mmid.cu) is exactly the flat index
 // into contiguous weights, so no extra index structures are needed.
+// When out != nullptr the FULL chain incl. sum-over-experts is fused: out is the
+// final [n_embd, n_tokens] tensor (the last ADD of build_moe_ffn's view+add chain)
+// and the scatter accumulates per token (accum_neu = n_expert_used).
 // Returns true when handled; false = fall back to unfused execution.
 static bool ggml_cuda_mul_mat_id_fused_weights(ggml_backend_cuda_context & ctx,
-        const ggml_tensor * mmid, ggml_tensor * mul) {
+        const ggml_tensor * mmid, ggml_tensor * mul, ggml_tensor * out = nullptr) {
     const ggml_tensor * src0 = mmid->src[0];
     const ggml_tensor * src1 = mmid->src[1];
     const ggml_tensor * ids  = mmid->src[2];
@@ -4157,6 +4160,12 @@ static bool ggml_cuda_mul_mat_id_fused_weights(ggml_backend_cuda_context & ctx,
         return false;
     }
 
+    // full-chain fusion (sum-over-experts): out must be contiguous [n_embd, n_tokens]
+    if (out && (!ggml_is_contiguous(out) || out->type != GGML_TYPE_F32 ||
+                out->ne[0] != mmid->ne[0] || out->ne[1] != n_tokens || out->ne[2] != 1)) {
+        return false;
+    }
+
     cudaStream_t stream = ctx.stream();
     ggml_cuda_moe_ids_args ids_args = {
         (const int32_t *) ids->data,
@@ -4164,23 +4173,29 @@ static bool ggml_cuda_mul_mat_id_fused_weights(ggml_backend_cuda_context & ctx,
         (int) (ids->nb[1] / ggml_element_size(ids)),
         (int) (src1->nb[2] / src1->nb[1]),
     };
-    const int64_t s11  = src1->nb[1] / ggml_type_size(src1->type);
-    const int64_t s1   = mul->nb[1]  / ggml_type_size(mul->type);
+    ggml_tensor * dst_t = out ? out : mul;
+    const int accum_neu = out ? (int) n_expert_used : 0;
+    const int64_t s11  = src1->nb[1]  / ggml_type_size(src1->type);
+    const int64_t s1   = dst_t->nb[1] / ggml_type_size(dst_t->type);
     const int     Mtot = (int) (n_tokens * n_expert_used);
 
     const int rc = src0->type == GGML_TYPE_NVFP4 ?
         ggml_cuda_cutlass_moe_nvfp4_prefill(
-            src0->data, (const float *) src1->data, &ids_args, (float *) mul->data,
+            src0->data, (const float *) src1->data, &ids_args, (float *) dst_t->data,
             (int) src0->ne[2], (int) src0->ne[1], (int) src0->ne[0], Mtot,
-            s11, s1, src0->nb[1], src0->nb[2], (const float *) w->data, stream) :
+            s11, s1, src0->nb[1], src0->nb[2], (const float *) w->data, accum_neu, stream) :
         ggml_cuda_cutlass_moe_f16_prefill(
-            src0->data, (const float *) src1->data, &ids_args, (float *) mul->data,
+            src0->data, (const float *) src1->data, &ids_args, (float *) dst_t->data,
             (int) src0->ne[2], (int) src0->ne[1], (int) src0->ne[0], Mtot,
-            s11, s1, src0->nb[1], src0->nb[2], (const float *) w->data, stream);
+            s11, s1, src0->nb[1], src0->nb[2], (const float *) w->data, accum_neu, stream);
     CUDA_CHECK(cudaGetLastError());
     if (rc == 0 && getenv("FCMOE_DEBUG")) {
         static bool once = false;
-        if (!once) { once = true; fprintf(stderr, "[FCMOE] FUSED mul_mat_id+routing-mul ACTIVE\n"); fflush(stderr); }
+        if (!once) {
+            once = true;
+            fprintf(stderr, "[FCMOE] FUSED mul_mat_id+routing-mul%s ACTIVE\n", out ? "+expert-sum" : "");
+            fflush(stderr);
+        }
     }
     return rc == 0;
 }
@@ -4197,12 +4212,45 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     ggml_tensor * node = cgraph->nodes[i];
 
 #ifdef GGML_CUDA_CUTLASS_FP4
-    // MUL_MAT_ID + routing-weight MUL -> CUTLASS bridge with fused scatter epilogue
+    // MUL_MAT_ID + routing-weight MUL (+ optional VIEWxN + ADDx(N-1) expert sum)
+    // -> CUTLASS bridge with fused scatter epilogue
     if (node->op == GGML_OP_MUL_MAT_ID && i + 1 < cgraph->n_nodes &&
         cgraph->nodes[i + 1]->op == GGML_OP_MUL && cgraph->nodes[i + 1]->src[0] == node) {
+        ggml_tensor * mul = cgraph->nodes[i + 1];
+
+        // full chain: build_moe_ffn emits neu VIEWs of the MUL output followed by
+        // neu-1 ADDs accumulating them. Match it structurally.
+        const int neu = (int) node->src[2]->ne[0]; // ids->ne[0] = n_expert_used
+        if (neu >= 2 && i + 1 + neu + (neu - 1) < cgraph->n_nodes) {
+            bool chain_ok = true;
+            for (int v = 0; v < neu && chain_ok; ++v) {
+                const ggml_tensor * vw = cgraph->nodes[i + 2 + v];
+                chain_ok = vw->op == GGML_OP_VIEW && vw->src[0] == mul;
+            }
+            for (int a = 0; a < neu - 1 && chain_ok; ++a) {
+                const ggml_tensor * ad = cgraph->nodes[i + 2 + neu + a];
+                chain_ok = ad->op == GGML_OP_ADD &&
+                    ad->src[0] == (a == 0 ? cgraph->nodes[i + 2] : cgraph->nodes[i + 2 + neu + a - 1]) &&
+                    ad->src[1] == cgraph->nodes[i + 2 + a + 1];
+            }
+            if (chain_ok) {
+                std::vector<ggml_op> ops;
+                ops.push_back(GGML_OP_MUL_MAT_ID);
+                ops.push_back(GGML_OP_MUL);
+                for (int v = 0; v < neu; ++v)     ops.push_back(GGML_OP_VIEW);
+                for (int a = 0; a < neu - 1; ++a) ops.push_back(GGML_OP_ADD);
+                const int i_out = i + 1 + neu + (neu - 1);
+                if (ggml_can_fuse_subgraph(cgraph, i, (int) ops.size(), ops.data(), &i_out, 1) &&
+                    ggml_cuda_mul_mat_id_fused_weights(*cuda_ctx, node, mul, cgraph->nodes[i_out])) {
+                    return (int) ops.size() - 1;
+                }
+            }
+        }
+
+        // partial: fuse just the routing-weight multiply
         const enum ggml_op mmid_mul_ops[2] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL };
         if (ggml_can_fuse(cgraph, i, mmid_mul_ops, 2) &&
-            ggml_cuda_mul_mat_id_fused_weights(*cuda_ctx, node, cgraph->nodes[i + 1])) {
+            ggml_cuda_mul_mat_id_fused_weights(*cuda_ctx, node, mul)) {
             return 1;
         }
     }

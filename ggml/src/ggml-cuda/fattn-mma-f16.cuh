@@ -59,6 +59,10 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128,  8, 128, 2, 128,  64,  64,  64, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 16, 128, 2,  64,  64,  64,  64, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 32, 128, 2,  64,  64,  64,  64, 2, true);
+    // FC sweep 2026-07-02 (sm120, Qwen3 GQA8 = ncols 8x8): 128thr/occ2/fa64 (default),
+    // fa128/occ1/128thr, 256thr/occ1/fa128 all within noise (19.5-19.9k e2e); fa256
+    // impossible (cp-async mask preload cap). Config knobs are NOT the FA bottleneck
+    // on Blackwell -> keeping upstream default; speedup requires a new kernel design.
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 64, 128, 2,  64,  64,  64,  64, 2, true);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(192, 128,  8,  64, 4,  64,  96,  64,  64, 2, true);

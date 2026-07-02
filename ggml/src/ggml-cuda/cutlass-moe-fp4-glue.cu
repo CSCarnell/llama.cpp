@@ -396,16 +396,22 @@ extern "C" void ggml_cuda_nvfp4_gather_quant(
 
 // scatter + rescale + bf16->f32: one block per compact row, vectorized 4-wide.
 // N % 4 == 0 always holds here (N is a multiple of 128 per _supported()).
+// accum=false: dst row = ids_dst[m], overwrite (plain scatter).
+// accum=true : dst row = ids_dst[m]/accum_neu (token index), atomicAdd — fuses
+//              the sum-over-experts (view+add chain) into the scatter. Caller
+//              must zero dst first.
+template <bool accum>
 __global__ void k_scatter_rowscaled(
         const uint16_t * __restrict__ src, const float * __restrict__ row_scale,
         const int32_t * __restrict__ ids_dst, float * __restrict__ dst,
-        int Mtot, int N, int64_t s1, const float * __restrict__ fuse_w) {
+        int Mtot, int N, int64_t s1, const float * __restrict__ fuse_w, int accum_neu) {
     const int m = blockIdx.x;
     if (m >= Mtot) return;
+    const int id = ids_dst[m];
     float g = row_scale[m];
-    if (fuse_w) g *= fuse_w[ids_dst[m]];   // fused routing-weight multiply
+    if (fuse_w) g *= fuse_w[id];   // fused routing-weight multiply
     const ushort4 * s4 = (const ushort4 *) (src + (size_t) m * N);
-    float * drow = dst + (int64_t) ids_dst[m] * s1;
+    float * drow = dst + (int64_t) (accum ? id / accum_neu : id) * s1;
     const bool aligned = ((uintptr_t) drow & 15) == 0;
     for (int n4 = threadIdx.x; n4 < N / 4; n4 += blockDim.x) {
         const ushort4 v = s4[n4];
@@ -415,7 +421,10 @@ __global__ void k_scatter_rowscaled(
         b = (uint32_t) v.y << 16; memcpy(&f.y, &b, 4); f.y *= g;
         b = (uint32_t) v.z << 16; memcpy(&f.z, &b, 4); f.z *= g;
         b = (uint32_t) v.w << 16; memcpy(&f.w, &b, 4); f.w *= g;
-        if (aligned) {
+        if (accum) {
+            atomicAdd(drow + n4 * 4 + 0, f.x); atomicAdd(drow + n4 * 4 + 1, f.y);
+            atomicAdd(drow + n4 * 4 + 2, f.z); atomicAdd(drow + n4 * 4 + 3, f.w);
+        } else if (aligned) {
             ((float4 *) drow)[n4] = f;
         } else {
             drow[n4 * 4 + 0] = f.x; drow[n4 * 4 + 1] = f.y;
@@ -426,12 +435,17 @@ __global__ void k_scatter_rowscaled(
 
 extern "C" void ggml_cuda_nvfp4_scatter_rowscaled(
         const void * d_bf16, const float * row_scale, const int32_t * ids_dst,
-        float * dst, int Mtot, int N, int64_t s1, const float * fuse_w, cudaStream_t stream) {
+        float * dst, int Mtot, int N, int64_t s1, const float * fuse_w, int accum_neu,
+        cudaStream_t stream) {
     const int threads = 256;
-    k_scatter_rowscaled<<<(unsigned) Mtot, threads, 0, stream>>>(
-        (const uint16_t *) d_bf16, row_scale, ids_dst, dst, Mtot, N, s1, fuse_w);
+    if (accum_neu > 0) {
+        k_scatter_rowscaled<true><<<(unsigned) Mtot, threads, 0, stream>>>(
+            (const uint16_t *) d_bf16, row_scale, ids_dst, dst, Mtot, N, s1, fuse_w, accum_neu);
+    } else {
+        k_scatter_rowscaled<false><<<(unsigned) Mtot, threads, 0, stream>>>(
+            (const uint16_t *) d_bf16, row_scale, ids_dst, dst, Mtot, N, s1, fuse_w, accum_neu);
+    }
 }
-
 // ============================================================================
 // F16 MoE prefill glue (2026-07-02): gather f32->f16, scatter f32->f32
 // ============================================================================
@@ -470,16 +484,22 @@ extern "C" void ggml_cuda_moe_gather_f32_to_f16(
 }
 
 // dst[ids_dst[m]*s1 + n] = src[m*N + n]; one block per compact row, float4
+template <bool accum>
 __global__ void k_scatter_f32(
         const float * __restrict__ src, const int32_t * __restrict__ ids_dst,
         float * __restrict__ dst, int Mtot, int N, int64_t s1,
-        const float * __restrict__ fuse_w) {
+        const float * __restrict__ fuse_w, int accum_neu) {
     const int m = blockIdx.x;
     if (m >= Mtot) return;
-    const float g = fuse_w ? fuse_w[ids_dst[m]] : 1.0f;  // fused routing-weight multiply
+    const int id = ids_dst[m];
+    const float g = fuse_w ? fuse_w[id] : 1.0f;  // fused routing-weight multiply
     const float * srow = src + (size_t) m * N;
-    float * drow = dst + (int64_t) ids_dst[m] * s1;
-    if ((((uintptr_t) srow | (uintptr_t) drow) & 15) == 0 && (N & 3) == 0) {
+    float * drow = dst + (int64_t) (accum ? id / accum_neu : id) * s1;
+    if (accum) {
+        for (int n = threadIdx.x; n < N; n += blockDim.x) {
+            atomicAdd(drow + n, srow[n] * g);
+        }
+    } else if ((((uintptr_t) srow | (uintptr_t) drow) & 15) == 0 && (N & 3) == 0) {
         for (int i = threadIdx.x; i < N / 4; i += blockDim.x) {
             float4 v = ((const float4 *) srow)[i];
             v.x *= g; v.y *= g; v.z *= g; v.w *= g;
@@ -494,6 +514,10 @@ __global__ void k_scatter_f32(
 
 extern "C" void ggml_cuda_moe_scatter_f32(
         const float * src, const int32_t * ids_dst, float * dst,
-        int Mtot, int N, int64_t s1, const float * fuse_w, cudaStream_t stream) {
-    k_scatter_f32<<<(unsigned) Mtot, 256, 0, stream>>>(src, ids_dst, dst, Mtot, N, s1, fuse_w);
+        int Mtot, int N, int64_t s1, const float * fuse_w, int accum_neu, cudaStream_t stream) {
+    if (accum_neu > 0) {
+        k_scatter_f32<true><<<(unsigned) Mtot, 256, 0, stream>>>(src, ids_dst, dst, Mtot, N, s1, fuse_w, accum_neu);
+    } else {
+        k_scatter_f32<false><<<(unsigned) Mtot, 256, 0, stream>>>(src, ids_dst, dst, Mtot, N, s1, fuse_w, accum_neu);
+    }
 }
