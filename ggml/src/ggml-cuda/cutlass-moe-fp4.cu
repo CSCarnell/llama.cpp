@@ -38,7 +38,7 @@ static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
 using ElementAccumulator = float;
 using ArchTag        = cutlass::arch::Sm120;
 using OperatorClass  = cutlass::arch::OpClassBlockScaledTensorOp;
-using ThreadBlockShape = Shape<_128,_128,_128>;  // tile sweep 2026-07-02: 128x128x128 best (23.4k); K256=23.3k, M256=22.9k, N256=22.5k
+using ThreadBlockShape = Shape<_128,_128,_128>;  // optimal: swept K256 M256 N256 M64(no-compile) N64 all slower (2026-07-02)
 using ClusterShape   = Shape<_1,_1,_1>;
 using ProblemShape   = cutlass::gemm::GroupProblemShape<Shape<int,int,int>>;
 

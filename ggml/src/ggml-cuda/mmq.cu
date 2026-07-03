@@ -288,6 +288,17 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 #ifdef GGML_CUDA_FORCE_CUBLAS
     return false;
 #endif // GGML_CUDA_FORCE_CUBLAS
+    // runtime escape hatch: route large-batch dense quantized matmuls to cuBLAS (dequant+GEMM)
+    // GGML_CUDA_MMQ_MAX_BATCH=N -> use cuBLAS when ne11 > N (dense only, MoE unaffected)
+    {
+        static const int mmq_max_batch = []() {
+            const char * e = getenv("GGML_CUDA_MMQ_MAX_BATCH");
+            return e ? atoi(e) : 0;
+        }();
+        if (mmq_max_batch > 0 && n_experts == 0 && ne11 > mmq_max_batch) {
+            return false;
+        }
+    }
 
     bool mmq_supported;
 
