@@ -549,12 +549,14 @@ __global__ void k_scatter_rowscaled(
 // ---------------------------------------------------------------------------
 __global__ void k_route_hist(
         const int32_t * __restrict__ ids, int32_t * __restrict__ counts,
-        int n_tokens, int neu, int si1) {
+        int n_tokens, int neu, int si1, int E) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_tokens * neu) return;
     const int it  = i / neu;
     const int iex = i % neu;
-    atomicAdd(&counts[ids[it * si1 + iex]], 1);
+    const int e   = ids[it * si1 + iex];
+    if (e < 0 || e >= E) return; // skip padded/garbage expert ids (OOB write guard)
+    atomicAdd(&counts[e], 1);
 }
 // single block, E <= 1024: exclusive scan counts -> bounds[0..E], zero cursors
 __global__ void k_route_scan(
@@ -581,12 +583,13 @@ __global__ void k_route_scatter(
         const int32_t * __restrict__ ids, const int32_t * __restrict__ bounds,
         int32_t * __restrict__ cursor, int32_t * __restrict__ ids_src1,
         int32_t * __restrict__ ids_dst, int n_tokens, int neu, int nchannels_y,
-        int si1, int sis1) {
+        int si1, int sis1, int E) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_tokens * neu) return;
     const int it  = i / neu;
     const int iex = i % neu;
     const int e   = ids[it * si1 + iex];
+    if (e < 0 || e >= E) return; // must mirror k_route_hist guard
     const int pos = bounds[e] + atomicAdd(&cursor[e], 1);
     ids_src1[pos] = it * sis1 + iex % nchannels_y;
     ids_dst [pos] = it * neu  + iex;
@@ -601,11 +604,11 @@ extern "C" void ggml_cuda_moe_build_routing(
     cudaMemsetAsync(counts, 0, E * sizeof(int32_t), stream);
     const int Mtot = n_tokens * neu;
     const int nb = (Mtot + 255) / 256;
-    k_route_hist<<<nb, 256, 0, stream>>>(ids, counts, n_tokens, neu, si1);
+    k_route_hist<<<nb, 256, 0, stream>>>(ids, counts, n_tokens, neu, si1, E);
     int sb = 32; while (sb < E + 1) sb <<= 1;   // block >= E+1 threads, pow2
     k_route_scan<<<1, sb, 0, stream>>>(counts, bounds, cursor, E);
     k_route_scatter<<<nb, 256, 0, stream>>>(ids, bounds, cursor, ids_src1, ids_dst,
-                                            n_tokens, neu, nchannels_y, si1, sis1);
+                                            n_tokens, neu, nchannels_y, si1, sis1, E);
 }
 
 

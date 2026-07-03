@@ -998,7 +998,7 @@ private:
     std::vector<async_output_job> async_pending;                // collected by main, awaiting kick
     std::vector<async_output_job> async_pending_for_worker;     // handed to worker by async_kick()
     std::vector<async_output_job> async_inflight;               // worker's local processing buffer
-    std::vector<server_slot *>    async_released;               // worker -> main: slots to finalize
+    std::vector<std::pair<server_slot *, int>> async_released;  // worker -> main: (slot, task id) to finalize
 
     void destroy() {
         async_stop_worker();
@@ -2536,7 +2536,17 @@ private:
                     // release slot linked with the task id
                     for (auto & slot : slots) {
                         if (slot.task && slot.task->id == task.id_target) {
-                            slot.release();
+                            // the async output worker may hold an in-flight job
+                            // dereferencing this slot's task/generated_text;
+                            // release() frees them -> drain the worker first.
+                            if (async_output) {
+                                async_wait_idle();
+                                async_apply_releases();
+                            }
+                            // re-check: the drain may have finalized this task
+                            if (slot.task && slot.task->id == task.id_target) {
+                                slot.release();
+                            }
                             break;
                         }
                     }
@@ -2873,7 +2883,7 @@ private:
                     // owns slot lifecycle, metrics and the final response.
                     std::lock_guard<std::mutex> lk(async_mtx);
                     slot->async_to_release = true;
-                    async_released.push_back(slot);
+                    async_released.emplace_back(slot, job.id_task);
                 } else {
                     slot->print_timings_tg();
                 }
@@ -2918,12 +2928,21 @@ private:
     // finalize slots the worker flagged as stopped (main thread: metrics +
     // final response + release). Safe to call only when the worker is idle.
     void async_apply_releases() {
-        std::vector<server_slot *> released;
+        std::vector<std::pair<server_slot *, int>> released;
         {
             std::lock_guard<std::mutex> lk(async_mtx);
             released.swap(async_released);
         }
-        for (server_slot * slot : released) {
+        for (auto & [slot, id_task] : released) {
+            // The slot may have been released by another path (cancel/disconnect/
+            // send_error) between the worker flagging it and us finalizing it.
+            // In that case slot->task is null (or a different task) — calling
+            // send_final_response() would null-deref slot->task. Just clear the
+            // flag and skip; the other path already answered/errored the request.
+            if (!slot->is_processing() || !slot->task || slot->task->id != id_task) {
+                slot->async_to_release = false;
+                continue;
+            }
             slot->print_timings();
             send_final_response(*slot);
             metrics.on_prediction(*slot);
@@ -2944,6 +2963,12 @@ private:
             if (slot->async_to_release) {
                 continue;
             }
+            // same staleness guard as the worker: the slot may have been
+            // released (cancel/disconnect/error) since this job was queued.
+            if (!slot->is_processing() || !slot->task || slot->task->id != job.id_task) {
+                continue;
+            }
+            job.result.text_to_send = common_token_to_piece(slot->ctx_tgt, job.result.tok, job.accept_special);
             if (!process_token(job.result, *slot, /*from_async=*/true, job.prompt_n_tokens)) {
                 slot->print_timings();
                 send_final_response(*slot);

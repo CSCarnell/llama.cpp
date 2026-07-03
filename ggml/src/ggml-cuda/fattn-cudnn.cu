@@ -312,7 +312,12 @@ bool ggml_cuda_flash_attn_ext_cudnn_try(ggml_backend_cuda_context & ctx, ggml_te
     if ((int64_t) seq_kv > kv_rem) {
         return false; // malformed band (shouldn't happen)
     }
-    int64_t dim_kv = ((int64_t) seq_kv + 511) & ~511ll;
+    static const int64_t kv_bucket = [] {
+        const char * s = getenv("GGML_CUDA_CUDNN_FA_KV_BUCKET");
+        const int64_t v = s ? atoll(s) : 512;
+        return v > 0 ? v : 512;
+    }();
+    int64_t dim_kv = ((int64_t) seq_kv + kv_bucket - 1) & ~(kv_bucket - 1);
     if (dim_kv > kv_rem) {
         dim_kv = kv_rem;
     }

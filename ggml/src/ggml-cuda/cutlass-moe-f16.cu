@@ -77,7 +77,7 @@ static void * f16_grow(void ** p, size_t * cap, size_t need) {
     if (need > *cap) {
         if (*p) cudaFree(*p);
         size_t sz = need + need / 4;
-        cudaMalloc(p, sz);
+        if (cudaMalloc(p, sz) != cudaSuccess) { cudaGetLastError(); *p = nullptr; *cap = 0; return nullptr; }
         *cap = sz;
     }
     return *p;
@@ -101,6 +101,7 @@ extern "C" int ggml_cuda_cutlass_moe_f16_prefill(
     const int32_t * ids_src1; const int32_t * ids_dst; const int32_t * expert_bounds;
     uint64_t routing_gen;
     ggml_cuda_moe_routing_get(ids, stream, &ids_src1, &ids_dst, &expert_bounds, &routing_gen);
+    if (!ids_src1) return 1; // routing OOM -> fall back
 
     std::lock_guard<std::mutex> lk(g_f16_mtx);
 
@@ -108,7 +109,9 @@ extern "C" int ggml_cuda_cutlass_moe_f16_prefill(
     if (E > g_f16.E_cap) {
         if (g_f16.args_blob) cudaFree(g_f16.args_blob);
         const size_t per_e = sizeof(cutlass::gemm::GemmCoord) + 4 * sizeof(void *) + 4 * sizeof(int64_t);
-        cudaMalloc(&g_f16.args_blob, (per_e + 64) * (size_t) E);
+        if (cudaMalloc(&g_f16.args_blob, (per_e + 64) * (size_t) E) != cudaSuccess) {
+            cudaGetLastError(); g_f16.args_blob = nullptr; return 1; // OOM -> fall back
+        }
         uint8_t * base = (uint8_t *) g_f16.args_blob;
         auto carve = [&](size_t bytes) { void * r = base; base += (bytes + 15) & ~size_t(15); return r; };
         g_f16.ps  = (cutlass::gemm::GemmCoord *) carve(sizeof(cutlass::gemm::GemmCoord) * E);
@@ -124,6 +127,7 @@ extern "C" int ggml_cuda_cutlass_moe_f16_prefill(
     }
     f16_grow(&g_f16.dA, &g_f16.a_cap, (size_t) Mtot * K * sizeof(cutlass::half_t));
     f16_grow(&g_f16.dD, &g_f16.d_cap, (size_t) Mtot * N * sizeof(float));
+    if (!g_f16.dA || !g_f16.dD) return 1; // scratch OOM -> fall back
 
     // ---- device-side prep: gather+convert, group args (no syncs) ----
     // A-operand reuse across gate->up (same src1 + routing generation)
@@ -158,6 +162,7 @@ extern "C" int ggml_cuda_cutlass_moe_f16_prefill(
     F16GemmGrouped gemm;
     const size_t wssz = F16GemmGrouped::get_workspace_size(args);
     f16_grow(&g_f16.ws, &g_f16.ws_cap, wssz ? wssz : 1);
+    if (!g_f16.ws) return 1; // scratch OOM -> fall back
     if (gemm.can_implement(args) != cutlass::Status::kSuccess) return 2;
     if (gemm.initialize(args, g_f16.ws, stream) != cutlass::Status::kSuccess) return 3;
     if (gemm.run(stream) != cutlass::Status::kSuccess) return 4;
@@ -166,6 +171,7 @@ extern "C" int ggml_cuda_cutlass_moe_f16_prefill(
     if (accum_neu > 0 && accum_neu <= 16) {
         // no-atomic path: invert permutation, per-token register-accum gather
         f16_grow(&g_f16.dInv, &g_f16.inv_cap, (size_t) Mtot * sizeof(int32_t));
+        if (!g_f16.dInv) return 1; // scratch OOM -> fall back
         ggml_cuda_moe_invert_ids(ids_dst, (int32_t *) g_f16.dInv, Mtot, stream);
         ggml_cuda_moe_gather_accum_f32((const float *) g_f16.dD, (const int32_t *) g_f16.dInv,
                                        dst, Mtot / accum_neu, N, s1, fuse_w, accum_neu, stream);

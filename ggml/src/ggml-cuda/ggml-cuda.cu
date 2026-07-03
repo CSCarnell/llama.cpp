@@ -1810,9 +1810,21 @@ static void ggml_cuda_op_mul_mat_cublas(
 
         const auto & force_compute_type = ggml_cuda_cublas_get_force_compute_type();
 
+        // fc-inference: on Blackwell (sm_120+) F16-input tensor cores accumulate in F32
+        // at full throughput, so writing the cuBLAS result directly as F32 (COMPUTE_32F)
+        // is free on speed, strictly MORE accurate than F16 accumulate, AND eliminates the
+        // separate dst_f16->f32 convert kernel that the else-branch needs (~3.3% of NVFP4
+        // prefill GPU time + ~1536 kernel launches on the dense attention projections).
+        // Default ON for Blackwell; env FC_CUBLAS_F32_OUT=0 forces the legacy path for A/B.
+        static const int fc_f32_out_env = []{ const char * e = getenv("FC_CUBLAS_F32_OUT"); return e ? atoi(e) : -1; }();
+        const bool fc_blackwell_f32_out = GGML_CUDA_CC_IS_NVIDIA(cc)
+                                          && cc >= GGML_CUDA_CC_BLACKWELL
+                                          && fc_f32_out_env != 0;
+
         if (!force_compute_type.fp16 && (GGML_CUDA_CC_IS_CDNA(cc)
                                         || GGML_CUDA_CC_IS_RDNA4(cc)
                                         || cc == GGML_CUDA_CC_VOLTA
+                                        || fc_blackwell_f32_out
                                         || force_compute_type.fp32))
         {
             const float alpha = 1.0f;
@@ -2651,7 +2663,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         static const bool cutlass_dense = getenv("GGML_CUDA_CUTLASS_MOE_PREFILL") != nullptr;
         static const int dense_min_m = [] {
             const char * s = getenv("GGML_CUDA_CUTLASS_DENSE_MIN");
-            return s ? atoi(s) : 1024;
+            return s ? atoi(s) : 64;
         }();
         if (cutlass_dense && !split && src0->type == GGML_TYPE_NVFP4 &&
             src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
@@ -2837,7 +2849,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         // faster (measured 2026-06-30). 1024 tokens @ top_k=8, E=128 -> Me ~ 64.
         static const int cutlass_prefill_min_tokens = [] {
             const char * s = getenv("GGML_CUDA_CUTLASS_MOE_PREFILL_MIN");
-            return s ? atoi(s) : 1024;
+            return s ? atoi(s) : 64;
         }();
         if (cutlass_prefill_enabled &&
             (src0->type == GGML_TYPE_NVFP4 || src0->type == GGML_TYPE_F16) &&
@@ -4153,7 +4165,7 @@ static bool ggml_cuda_mul_mat_id_fused_weights(ggml_backend_cuda_context & ctx,
     static const bool no_fuse = getenv("GGML_CUDA_CUTLASS_MOE_NO_FUSE") != nullptr;
     static const int min_tokens = [] {
         const char * s = getenv("GGML_CUDA_CUTLASS_MOE_PREFILL_MIN");
-        return s ? atoi(s) : 1024;
+        return s ? atoi(s) : 64;
     }();
     if (!enabled || no_fuse) {
         return false;
@@ -4259,7 +4271,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                                         getenv("GGML_CUDA_CUTLASS_MOE_NO_FFN") == nullptr;
         static const int ffn_min_tokens = [] {
             const char * s = getenv("GGML_CUDA_CUTLASS_MOE_PREFILL_MIN");
-            return s ? atoi(s) : 1024;
+            return s ? atoi(s) : 64;
         }();
 
         ggml_tensor * gate_n = nullptr, * up_n = nullptr;

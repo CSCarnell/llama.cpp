@@ -88,8 +88,24 @@ static const WeightCache& get_repacked_weights(
     WeightCache wc; wc.E=E; wc.N=N; wc.K=K;
     size_t Bsz   = (size_t)E * N * (K/2);
     size_t SFBsz = (size_t)E * N * (K/QSUB);
-    cudaMalloc(&wc.dB, Bsz);
-    cudaMalloc(&wc.dSFB, SFBsz);
+    // MUST check: at large ubatch/context the pool can leave too little VRAM and
+    // cudaMalloc fails -> unchecked nullptr write -> sticky illegal memory access
+    // (the ub>=2048 crash). On OOM cache a null entry so callers fall back to MMQ.
+    if (cudaMalloc(&wc.dB, Bsz) != cudaSuccess) {
+        cudaGetLastError(); // clear
+        wc.dB = nullptr; wc.dSFB = nullptr;
+        fprintf(stderr, "%s: cudaMalloc OOM repacking weights (%zu MiB) - falling back to MMQ for this tensor\n",
+                      __func__, (Bsz + SFBsz) >> 20);
+        return g_wc.emplace(w_blocks, wc).first->second;
+    }
+    if (cudaMalloc(&wc.dSFB, SFBsz) != cudaSuccess) {
+        cudaGetLastError(); // clear
+        cudaFree(wc.dB);
+        wc.dB = nullptr; wc.dSFB = nullptr;
+        fprintf(stderr, "%s: cudaMalloc OOM repacking weights (%zu MiB) - falling back to MMQ for this tensor\n",
+                      __func__, (Bsz + SFBsz) >> 20);
+        return g_wc.emplace(w_blocks, wc).first->second;
+    }
     cudaMemsetAsync(wc.dSFB, 0, SFBsz, stream);
     ggml_cuda_nvfp4_repack_weights(w_blocks, wc.dB, wc.dSFB, E, N, K, nb01, nb02, stream);
     cudaStreamSynchronize(stream); // repack once; make weights visible before first GEMM
@@ -137,6 +153,7 @@ extern "C" int ggml_cuda_cutlass_moe_nvfp4(
             row_expert[expert_off[e] + i] = e;
 
     const WeightCache& wc = get_repacked_weights(w_blocks, E, N, K, nb01, nb02, stream);
+    if (!wc.dB) return 1; // repack OOM -> caller falls back to MMQ
 
     // ---- activation quant (glue) ----
     float* dg=nullptr; cudaMallocAsync(&dg, (size_t)Mtot*sizeof(float), stream);
@@ -314,7 +331,13 @@ extern "C" void ggml_cuda_moe_routing_get(
         const size_t need = ((size_t) Mtot * 2 + 3 * a->n_experts + 1) * sizeof(int32_t);
         if (need > g_rt.cap) {
             if (g_rt.buf) cudaFree(g_rt.buf);
-            cudaMalloc((void **) &g_rt.buf, need + need / 4);
+            if (cudaMalloc((void **) &g_rt.buf, need + need / 4) != cudaSuccess) {
+                cudaGetLastError();
+                g_rt.buf = nullptr; g_rt.cap = 0;
+                g_rt.key_ids = nullptr; g_rt.uses = 0;
+                *ids_src1 = nullptr; *ids_dst = nullptr; *bounds = nullptr;
+                return; // OOM -> caller must null-check and fall back to MMQ
+            }
             g_rt.cap = need + need / 4;
         }
         g_rt.ids_src1 = g_rt.buf;
@@ -385,7 +408,11 @@ static void * grow(void ** p, size_t * cap, size_t need) {
     if (need > *cap) {
         if (*p) cudaFree(*p);
         size_t sz = need + need / 4;            // 25% headroom to damp regrowth
-        cudaMalloc(p, sz);
+        if (cudaMalloc(p, sz) != cudaSuccess) { // OOM: clear sticky error, signal caller
+            cudaGetLastError();
+            *p = nullptr; *cap = 0;
+            return nullptr;
+        }
         *cap = sz;
     }
     return *p;
@@ -423,6 +450,7 @@ extern "C" int ggml_cuda_cutlass_dense_nvfp4(
     if (s1 != N) return 1;                 // direct rowscaled epilogue needs contiguous dst
     std::lock_guard<std::mutex> lk(g_pf_mtx);
     const WeightCache & wc = get_repacked_weights(w_blocks, 1, N, K, nb01, nb02, stream);
+    if (!wc.dB) return 1; // repack OOM -> caller falls back to MMQ
     // scratch shared with the MoE prefill path (same stream => ordered, safe),
     // but the A-reuse cache must be invalidated since dAq is overwritten here.
     s_a_src1 = nullptr;
@@ -432,9 +460,12 @@ extern "C" int ggml_cuda_cutlass_dense_nvfp4(
     grow((void **) &g_pf.dSFA, &g_pf.sfa_cap, sf_rows * (K / QSUB));
     grow((void **) &g_pf.dG,   &g_pf.g_cap,   (size_t) M * sizeof(float));
     grow((void **) &g_pf.dD,   &g_pf.d_cap,   (size_t) M * N * sizeof(ElementD));
+    if (!g_pf.dAq || !g_pf.dSFA || !g_pf.dG || !g_pf.dD) return 1; // scratch OOM -> fall back to MMQ
     // device bounds/sf_off for E=1: [0, M], [0]
     static int32_t * dB1 = nullptr;
-    if (!dB1) cudaMalloc(&dB1, 3 * sizeof(int32_t));
+    if (!dB1 && cudaMalloc(&dB1, 3 * sizeof(int32_t)) != cudaSuccess) {
+        cudaGetLastError(); dB1 = nullptr; return 1; // OOM -> fall back
+    }
     // Q/K/V projections share src1 -> reuse quantized A operand across calls
     const bool d_reuse = s_d_src1 == src1 && s_d_K == K && s_d_M == M;
     if (!d_reuse) {
@@ -483,9 +514,11 @@ extern "C" int ggml_cuda_cutlass_moe_nvfp4_prefill(
     const int32_t * ids_src1; const int32_t * ids_dst; const int32_t * expert_bounds;
     uint64_t routing_gen;
     ggml_cuda_moe_routing_get(ids, stream, &ids_src1, &ids_dst, &expert_bounds, &routing_gen);
+    if (!ids_src1) return 1; // routing OOM -> fall back to MMQ
 
     std::lock_guard<std::mutex> lk(g_pf_mtx);
     const WeightCache & wc = get_repacked_weights(w_blocks, E, N, K, nb01, nb02, stream);
+    if (!wc.dB) return 1; // repack OOM -> caller falls back to MMQ
 
     // ---- scratch (grow-only; steady-state = zero allocations) ----
     if (E > g_pf.E_cap) {
@@ -495,7 +528,9 @@ extern "C" int ggml_cuda_cutlass_moe_nvfp4_prefill(
             2 * sizeof(void *) + 2 * sizeof(void *) + 2 * sizeof(void *) +
             sizeof(StrideA) + sizeof(StrideB) + sizeof(StrideC) + sizeof(StrideD) +
             sizeof(LayoutSFA) + sizeof(LayoutSFB) + sizeof(int32_t);
-        cudaMalloc(&g_pf.args_blob, (per_e + 64) * (size_t) E); // slack for 16B alignment carving
+        if (cudaMalloc(&g_pf.args_blob, (per_e + 64) * (size_t) E) != cudaSuccess) { // slack for 16B alignment carving
+            cudaGetLastError(); g_pf.args_blob = nullptr; return 1; // OOM -> fall back
+        }
         uint8_t * base = (uint8_t *) g_pf.args_blob;
         auto carve = [&](size_t bytes) { void * r = base; base += (bytes + 15) & ~size_t(15); return r; };
         g_pf.ps   = (typename ProblemShape::UnderlyingProblemShape *) carve(sizeof(*g_pf.ps) * E);
@@ -519,6 +554,7 @@ extern "C" int ggml_cuda_cutlass_moe_nvfp4_prefill(
     grow((void **) &g_pf.dSFA, &g_pf.sfa_cap, sf_rows * (K / QSUB));
     grow((void **) &g_pf.dG,   &g_pf.g_cap,   (size_t) Mtot * sizeof(float));
     grow((void **) &g_pf.dD,   &g_pf.d_cap,   (size_t) Mtot * N * sizeof(ElementD));
+    if (!g_pf.dAq || !g_pf.dSFA || !g_pf.dG || !g_pf.dD) return 1; // scratch OOM -> fall back to MMQ
 
     // ---- device-side prep: sf_offsets -> gather+quant -> group args (no syncs) ----
     // A-operand reuse: gate and up projections of one layer consume the SAME
@@ -573,6 +609,7 @@ extern "C" int ggml_cuda_cutlass_moe_nvfp4_prefill(
         // no-atomic path: invert permutation once, then per-token register-accum
         // gather (each dst element written exactly once; no memset, no atomics)
         grow((void **) &g_pf.dInv, &g_pf.inv_cap, (size_t) Mtot * sizeof(int32_t));
+        if (!g_pf.dInv) return 1; // scratch OOM -> fall back to MMQ
         ggml_cuda_moe_invert_ids(ids_dst, g_pf.dInv, Mtot, stream);
         ggml_cuda_nvfp4_gather_accum_rowscaled(g_pf.dD, g_pf.dG, g_pf.dInv, dst,
                                                Mtot / accum_neu, N, s1, fuse_w, accum_neu, stream);
@@ -643,6 +680,7 @@ extern "C" int ggml_cuda_cutlass_moe_nvfp4_ffn(
     const int32_t * ids_src1; const int32_t * ids_dst; const int32_t * bounds;
     uint64_t routing_gen; (void) routing_gen;
     ggml_cuda_moe_routing_get(ids, stream, &ids_src1, &ids_dst, &bounds, &routing_gen);
+    if (!ids_src1) return 1; // routing OOM -> fall back to MMQ
     // this path consumes routing exactly once per layer -> kill the cache entry
     // so the next layer's ids (possibly same address) can never false-hit
     ggml_cuda_moe_routing_expire();
@@ -651,6 +689,7 @@ extern "C" int ggml_cuda_cutlass_moe_nvfp4_ffn(
     const WeightCache & wcg = get_repacked_weights(w_gate, E, N_gu,  K,    g_nb01, g_nb02, stream);
     const WeightCache & wcu = get_repacked_weights(w_up,   E, N_gu,  K,    u_nb01, u_nb02, stream);
     const WeightCache & wcd = get_repacked_weights(w_down, E, N_out, N_gu, d_nb01, d_nb02, stream);
+    if (!wcg.dB || !wcu.dB || !wcd.dB) return 1; // repack OOM -> caller falls back
 
     if (E > g_pf.E_cap) {
         // args blob built by the generic prefill path; build it here the same way
@@ -660,7 +699,9 @@ extern "C" int ggml_cuda_cutlass_moe_nvfp4_ffn(
             6 * sizeof(void *) +
             sizeof(StrideA) + sizeof(StrideB) + sizeof(StrideC) + sizeof(StrideD) +
             sizeof(LayoutSFA) + sizeof(LayoutSFB) + sizeof(int32_t);
-        cudaMalloc(&g_pf.args_blob, (per_e + 64) * (size_t) E);
+        if (cudaMalloc(&g_pf.args_blob, (per_e + 64) * (size_t) E) != cudaSuccess) {
+            cudaGetLastError(); g_pf.args_blob = nullptr; return 1; // OOM -> fall back
+        }
         uint8_t * base = (uint8_t *) g_pf.args_blob;
         auto carve = [&](size_t bytes) { void * r = base; base += (bytes + 15) & ~size_t(15); return r; };
         g_pf.ps   = (typename ProblemShape::UnderlyingProblemShape *) carve(sizeof(*g_pf.ps) * E);
@@ -687,6 +728,7 @@ extern "C" int ggml_cuda_cutlass_moe_nvfp4_ffn(
     grow((void **) &g_pf.dD1,  &g_pf.d1_cap,  (size_t) Mtot * N_gu * sizeof(ElementD));
     grow((void **) &g_pf.dD2,  &g_pf.d2_cap,  (size_t) Mtot * N_gu * sizeof(ElementD));
     grow((void **) &g_pf.dD,   &g_pf.d_cap,   (size_t) Mtot * N_out * sizeof(ElementD));
+    if (!g_pf.dAq || !g_pf.dSFA || !g_pf.dG || !g_pf.dG2 || !g_pf.dD1 || !g_pf.dD2 || !g_pf.dD) return 1; // scratch OOM -> fall back to MMQ
     s_a_src1 = nullptr;   // we clobber dAq/dSFA/dG below
     s_d_src1 = nullptr;   // dense A-cache clobbered too
 
@@ -708,6 +750,7 @@ extern "C" int ggml_cuda_cutlass_moe_nvfp4_ffn(
     // ---- epilogue: rescale + routing weights + expert sum into unsorted dst ----
     if (accum_neu > 0 && accum_neu <= 16) {
         grow((void **) &g_pf.dInv, &g_pf.inv_cap, (size_t) Mtot * sizeof(int32_t));
+        if (!g_pf.dInv) return 1; // scratch OOM -> fall back to MMQ
         ggml_cuda_moe_invert_ids(ids_dst, g_pf.dInv, Mtot, stream);
         ggml_cuda_nvfp4_gather_accum_rowscaled(g_pf.dD, g_pf.dG2, g_pf.dInv, dst,
                                                Mtot / accum_neu, N_out, s1, fuse_w, accum_neu, stream);
