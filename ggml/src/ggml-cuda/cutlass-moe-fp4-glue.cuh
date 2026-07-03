@@ -74,6 +74,15 @@ void ggml_cuda_nvfp4_gather_quant(
 // the graph-level ggml_mul(experts, weights) into the scatter (dst *= fuse_w).
 // accum_neu > 0: rows are accumulated per TOKEN (dst row = ids_dst[m]/accum_neu,
 // atomicAdd) — fuses the sum-over-experts too. dst must be pre-zeroed.
+// Fused SwiGLU + NVFP4 requant on SORTED rows (whole-FFN fusion): row m of
+// gate/up bf16 outputs (scaled by row_scale1[m]) -> silu(g)*u -> quantize to
+// a_e2m1/sfa with fresh row_scale2. K = ffn inner dim (gate/up N).
+void ggml_cuda_nvfp4_swiglu_quant(
+    const void * d_gate_bf16, const void * d_up_bf16, const float * row_scale1,
+    const int32_t * expert_bounds, const int32_t * sf_offsets,
+    float * row_scale2, void * a_e2m1, void * sfa,
+    int E, int Mtot, int K, cudaStream_t stream);
+
 void ggml_cuda_nvfp4_scatter_rowscaled(
     const void * d_bf16, const float * row_scale, const int32_t * ids_dst,
     float * dst, int Mtot, int N, int64_t s1, const float * fuse_w, int accum_neu,

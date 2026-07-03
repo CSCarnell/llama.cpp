@@ -42,7 +42,7 @@ int ggml_cuda_cutlass_dense_nvfp4(
     int N, int K, int M, int64_t s11, int64_t s1,
     size_t nb01, size_t nb02, cudaStream_t stream);
 
-// ZERO-SYNC prefill path (2026-07-02). Fully stream-ordered: no host syncs, no
+
 // per-call cudaMalloc (persistent grow-only scratch), no src1 materialization.
 // Hooks the mmq.cu mul_mat_id path using its device-side routing arrays:
 //   src1          : UNSORTED f32 activations (gathered internally via ids_src1)
@@ -87,6 +87,21 @@ int ggml_cuda_cutlass_moe_f16_prefill(
     const void * w_f16, const float * src1, const ggml_cuda_moe_ids_args * ids,
     float * dst, int E, int N, int K, int Mtot, int64_t s11, int64_t s1,
     size_t nb01, size_t nb02, const float * fuse_w, int accum_neu, cudaStream_t stream);
+
+// WHOLE-FFN fused MoE path: gate+up grouped GEMMs -> fused SwiGLU+NVFP4
+// requant on sorted rows -> down grouped GEMM -> routed/weighted scatter or
+// expert-sum into dst. Eliminates all intermediate unsort/sort round-trips
+// and f32 materialization of gate/up/act tensors. Same dst semantics as
+// ggml_cuda_cutlass_moe_nvfp4_prefill (fuse_w/accum_neu).
+//   N_gu = gate/up output dim (ffn inner dim), K = model dim, N_out = K usually.
+int ggml_cuda_cutlass_moe_nvfp4_ffn(
+    const void * w_gate, const void * w_up, const void * w_down,
+    const float * src1, const ggml_cuda_moe_ids_args * ids,
+    float * dst, int E, int N_gu, int K, int N_out, int Mtot,
+    int64_t s11, int64_t s1,
+    size_t g_nb01, size_t g_nb02, size_t u_nb01, size_t u_nb02,
+    size_t d_nb01, size_t d_nb02,
+    const float * fuse_w, int accum_neu, cudaStream_t stream);
 
 #ifdef __cplusplus
 }

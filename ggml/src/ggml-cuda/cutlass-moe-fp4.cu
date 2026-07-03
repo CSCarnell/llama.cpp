@@ -344,6 +344,15 @@ extern "C" void ggml_cuda_moe_routing_get(
     *bounds = g_rt.bounds; *generation = g_rt.generation;
 }
 
+// Force the next routing_get to recompute. The whole-FFN path consumes routing
+// exactly ONCE per layer, so without this the next layer's ids tensor (often
+// the same device address, graph-allocator reuse) would falsely hit the cache
+// at uses=1 and serve the previous layer's routing.
+extern "C" void ggml_cuda_moe_routing_expire(void) {
+    std::lock_guard<std::mutex> lk(g_rt_mtx);
+    g_rt.uses = 1000;
+}
+
 // persistent grow-only scratch (single device assumed; guarded by mutex)
 struct PrefillScratch {
     // per-expert argument arrays (sized E; realloc only if E grows)
@@ -364,6 +373,10 @@ struct PrefillScratch {
     ElementD * dD   = nullptr; size_t d_cap   = 0;   // Mtot*N
     int32_t  * dInv = nullptr; size_t inv_cap = 0;   // Mtot (inverse permutation)
     void     * ws   = nullptr; size_t ws_cap  = 0;   // GEMM workspace
+    // whole-FFN fusion extras (sorted gate/up outputs + second act row scale)
+    ElementD * dD1  = nullptr; size_t d1_cap  = 0;   // Mtot*N_gu (gate, sorted)
+    ElementD * dD2  = nullptr; size_t d2_cap  = 0;   // Mtot*N_gu (up, sorted)
+    float    * dG2  = nullptr; size_t g2_cap  = 0;   // Mtot (post-SwiGLU row scale)
 };
 static std::mutex g_pf_mtx;
 static PrefillScratch g_pf;
@@ -383,6 +396,12 @@ static void * grow(void ** p, size_t * cap, size_t need) {
 // SAME routing -> identical quantized A/SFA/G. Skip the quant pass on reuse.
 static const float * s_a_src1 = nullptr;
 static uint64_t s_a_gen = 0; static int s_a_K = -1, s_a_M = -1;
+
+// forward decl (defined below)
+extern "C" int ggml_cuda_cutlass_moe_nvfp4_prefill(
+        const void * w_blocks, const float * src1, const ggml_cuda_moe_ids_args * ids,
+        float * dst, int E, int N, int K, int Mtot, int64_t s11, int64_t s1,
+        size_t nb01, size_t nb02, const float * fuse_w, int accum_neu, cudaStream_t stream);
 
 // ===================== dense NVFP4 path (E=1, identity gather) ==============
 // Routes large-M dense NVFP4 matmuls (attention projections when the model
@@ -550,6 +569,140 @@ extern "C" int ggml_cuda_cutlass_moe_nvfp4_prefill(
             cudaMemsetAsync(dst, 0, (size_t) (Mtot / accum_neu) * s1 * sizeof(float), stream);
         }
         ggml_cuda_nvfp4_scatter_rowscaled(g_pf.dD, g_pf.dG, ids_dst, dst, Mtot, N, s1, fuse_w, accum_neu, stream);
+    }
+    return 0;
+}
+
+// ===================== WHOLE-FFN fused path (2026-07-02) ====================
+// gate GEMM -> fused SwiGLU+NVFP4 requant ON SORTED ROWS -> down GEMM.
+// Eliminates per-layer: 2x scatter (gate/up unsort), silu kernel, down-proj
+// re-gather+quant, and all intermediate f32 materialization. Routing is built
+// ONCE (gate/up ids); the down GEMM consumes sorted rows directly and the
+// final gather-accum epilogue lands in the unsorted output with routing
+// weights applied. ids_dst is ne11-independent (flat it*neu+iex), so the
+// gate-routing ids_dst is exactly the down-scatter target and fuse_w index.
+static int run_group_gemm_locked(const WeightCache & wc, const int32_t * bounds,
+        const int32_t * sf_off, const uint8_t * dAq, const uint8_t * dSFA,
+        ElementD * dOut, int E, int N, int K, cudaStream_t stream) {
+    {
+        const int threads = 128;
+        const int blocks = (E + threads - 1) / threads;
+        k_build_group_args<<<blocks, threads, 0, stream>>>(
+            bounds, sf_off, (const uint8_t *) wc.dB, (const uint8_t *) wc.dSFB,
+            dAq, dSFA, dOut,
+            g_pf.ps, g_pf.pA, g_pf.pB, g_pf.pC, g_pf.pD, g_pf.pSFA, g_pf.pSFB,
+            g_pf.sa, g_pf.sb, g_pf.sc, g_pf.sd, g_pf.la, g_pf.lb, E, N, K);
+    }
+    static cutlass::KernelHardwareInfo hw = [] {
+        cutlass::KernelHardwareInfo h; h.device_id = 0;
+        h.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
+        return h;
+    }();
+    typename Gemm::Arguments args;
+    args.mode = cutlass::gemm::GemmUniversalMode::kGrouped;
+    args.problem_shape = {E, g_pf.ps, nullptr};
+    args.mainloop = { g_pf.pA, g_pf.sa, g_pf.pB, g_pf.sb, g_pf.pSFA, g_pf.la, g_pf.pSFB, g_pf.lb };
+    decltype(args.epilogue.thread) fusion; fusion.alpha = 1.0f; fusion.beta = 0.0f;
+    args.epilogue = { fusion, g_pf.pC, g_pf.sc, g_pf.pD, g_pf.sd };
+    args.hw_info = hw;
+    Gemm gemm;
+    const size_t wssz = Gemm::get_workspace_size(args);
+    grow(&g_pf.ws, &g_pf.ws_cap, wssz ? wssz : 1);
+    if (gemm.can_implement(args) != cutlass::Status::kSuccess) return 2;
+    if (gemm.initialize(args, g_pf.ws, stream) != cutlass::Status::kSuccess) return 3;
+    if (gemm.run(stream) != cutlass::Status::kSuccess) return 4;
+    return 0;
+}
+
+extern "C" int ggml_cuda_cutlass_moe_nvfp4_ffn(
+        const void * w_gate, const void * w_up, const void * w_down,
+        const float * src1, const ggml_cuda_moe_ids_args * ids,
+        float * dst, int E, int N_gu, int K, int N_out, int Mtot,
+        int64_t s11, int64_t s1,
+        size_t g_nb01, size_t g_nb02, size_t u_nb01, size_t u_nb02,
+        size_t d_nb01, size_t d_nb02,
+        const float * fuse_w, int accum_neu, cudaStream_t stream) {
+    if (!ggml_cuda_cutlass_moe_nvfp4_supported(E, N_gu, K) ||
+        !ggml_cuda_cutlass_moe_nvfp4_supported(E, N_out, N_gu)) return 1;
+    if (Mtot <= 0 || E > 1024) return 1;
+    const size_t max_kf = (size_t) (K > N_gu ? K : N_gu);
+    if (max_kf * sizeof(float) + 128 > 96 * 1024) return 1; // gather/swiglu smem cap
+
+    const int32_t * ids_src1; const int32_t * ids_dst; const int32_t * bounds;
+    uint64_t routing_gen; (void) routing_gen;
+    ggml_cuda_moe_routing_get(ids, stream, &ids_src1, &ids_dst, &bounds, &routing_gen);
+    // this path consumes routing exactly once per layer -> kill the cache entry
+    // so the next layer's ids (possibly same address) can never false-hit
+    ggml_cuda_moe_routing_expire();
+
+    std::lock_guard<std::mutex> lk(g_pf_mtx);
+    const WeightCache & wcg = get_repacked_weights(w_gate, E, N_gu,  K,    g_nb01, g_nb02, stream);
+    const WeightCache & wcu = get_repacked_weights(w_up,   E, N_gu,  K,    u_nb01, u_nb02, stream);
+    const WeightCache & wcd = get_repacked_weights(w_down, E, N_out, N_gu, d_nb01, d_nb02, stream);
+
+    if (E > g_pf.E_cap) {
+        // args blob built by the generic prefill path; build it here the same way
+        if (g_pf.args_blob) cudaFree(g_pf.args_blob);
+        const size_t per_e =
+            sizeof(typename ProblemShape::UnderlyingProblemShape) +
+            6 * sizeof(void *) +
+            sizeof(StrideA) + sizeof(StrideB) + sizeof(StrideC) + sizeof(StrideD) +
+            sizeof(LayoutSFA) + sizeof(LayoutSFB) + sizeof(int32_t);
+        cudaMalloc(&g_pf.args_blob, (per_e + 64) * (size_t) E);
+        uint8_t * base = (uint8_t *) g_pf.args_blob;
+        auto carve = [&](size_t bytes) { void * r = base; base += (bytes + 15) & ~size_t(15); return r; };
+        g_pf.ps   = (typename ProblemShape::UnderlyingProblemShape *) carve(sizeof(*g_pf.ps) * E);
+        g_pf.pA   = (const ElementAData **) carve(sizeof(void *) * E);
+        g_pf.pB   = (const ElementBData **) carve(sizeof(void *) * E);
+        g_pf.pC   = (const ElementC **)     carve(sizeof(void *) * E);
+        g_pf.pD   = (ElementD **)           carve(sizeof(void *) * E);
+        g_pf.pSFA = (const ElementSF **)    carve(sizeof(void *) * E);
+        g_pf.pSFB = (const ElementSF **)    carve(sizeof(void *) * E);
+        g_pf.sa   = (StrideA *)   carve(sizeof(StrideA) * E);
+        g_pf.sb   = (StrideB *)   carve(sizeof(StrideB) * E);
+        g_pf.sc   = (StrideC *)   carve(sizeof(StrideC) * E);
+        g_pf.sd   = (StrideD *)   carve(sizeof(StrideD) * E);
+        g_pf.la   = (LayoutSFA *) carve(sizeof(LayoutSFA) * E);
+        g_pf.lb   = (LayoutSFB *) carve(sizeof(LayoutSFB) * E);
+        g_pf.sf_off = (int32_t *) carve(sizeof(int32_t) * E);
+        g_pf.E_cap = E;
+    }
+    const size_t sf_rows = (size_t) Mtot + 128 * (size_t) E;
+    grow((void **) &g_pf.dAq,  &g_pf.aq_cap,  (size_t) Mtot * (max_kf / 2));
+    grow((void **) &g_pf.dSFA, &g_pf.sfa_cap, sf_rows * (max_kf / QSUB));
+    grow((void **) &g_pf.dG,   &g_pf.g_cap,   (size_t) Mtot * sizeof(float));
+    grow((void **) &g_pf.dG2,  &g_pf.g2_cap,  (size_t) Mtot * sizeof(float));
+    grow((void **) &g_pf.dD1,  &g_pf.d1_cap,  (size_t) Mtot * N_gu * sizeof(ElementD));
+    grow((void **) &g_pf.dD2,  &g_pf.d2_cap,  (size_t) Mtot * N_gu * sizeof(ElementD));
+    grow((void **) &g_pf.dD,   &g_pf.d_cap,   (size_t) Mtot * N_out * sizeof(ElementD));
+    s_a_src1 = nullptr;   // we clobber dAq/dSFA/dG below
+
+    // ---- input quant (once for gate AND up) ----
+    ggml_cuda_nvfp4_sf_offsets(bounds, g_pf.sf_off, E, stream);
+    cudaMemsetAsync(g_pf.dSFA, 0, sf_rows * (K / QSUB), stream);
+    ggml_cuda_nvfp4_gather_quant(src1, ids_src1, bounds, g_pf.sf_off,
+                                 g_pf.dG, g_pf.dAq, g_pf.dSFA, E, Mtot, K, s11, stream);
+    // ---- gate & up GEMMs (sorted bf16 outputs) ----
+    int rc;
+    if ((rc = run_group_gemm_locked(wcg, bounds, g_pf.sf_off, g_pf.dAq, g_pf.dSFA, g_pf.dD1, E, N_gu, K, stream)) != 0) return rc;
+    if ((rc = run_group_gemm_locked(wcu, bounds, g_pf.sf_off, g_pf.dAq, g_pf.dSFA, g_pf.dD2, E, N_gu, K, stream)) != 0) return rc;
+    // ---- fused SwiGLU + requant on sorted rows (clobbers dAq/dSFA, stream-ordered) ----
+    cudaMemsetAsync(g_pf.dSFA, 0, sf_rows * (N_gu / QSUB), stream);
+    ggml_cuda_nvfp4_swiglu_quant(g_pf.dD1, g_pf.dD2, g_pf.dG, bounds, g_pf.sf_off,
+                                 g_pf.dG2, g_pf.dAq, g_pf.dSFA, E, Mtot, N_gu, stream);
+    // ---- down GEMM ----
+    if ((rc = run_group_gemm_locked(wcd, bounds, g_pf.sf_off, g_pf.dAq, g_pf.dSFA, g_pf.dD, E, N_out, N_gu, stream)) != 0) return rc;
+    // ---- epilogue: rescale + routing weights + expert sum into unsorted dst ----
+    if (accum_neu > 0 && accum_neu <= 16) {
+        grow((void **) &g_pf.dInv, &g_pf.inv_cap, (size_t) Mtot * sizeof(int32_t));
+        ggml_cuda_moe_invert_ids(ids_dst, g_pf.dInv, Mtot, stream);
+        ggml_cuda_nvfp4_gather_accum_rowscaled(g_pf.dD, g_pf.dG2, g_pf.dInv, dst,
+                                               Mtot / accum_neu, N_out, s1, fuse_w, accum_neu, stream);
+    } else {
+        if (accum_neu > 0) {
+            cudaMemsetAsync(dst, 0, (size_t) (Mtot / accum_neu) * s1 * sizeof(float), stream);
+        }
+        ggml_cuda_nvfp4_scatter_rowscaled(g_pf.dD, g_pf.dG2, ids_dst, dst, Mtot, N_out, s1, fuse_w, accum_neu, stream);
     }
     return 0;
 }

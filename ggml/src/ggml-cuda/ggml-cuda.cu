@@ -4242,6 +4242,143 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     ggml_tensor * node = cgraph->nodes[i];
 
 #ifdef GGML_CUDA_CUTLASS_FP4
+    // WHOLE-FFN MoE fusion: MUL_MAT_ID(gate) + MUL_MAT_ID(up) + GLU(swiglu) +
+    // MUL_MAT_ID(down) + MUL(w) [+ VIEWxN + ADDx(N-1)] -> one CUTLASS chain
+    // with fused SwiGLU+requant on sorted rows (no unsort/sort round-trips).
+    if (node->op == GGML_OP_MUL_MAT_ID && i + 4 < cgraph->n_nodes &&
+        cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT_ID &&
+        cgraph->nodes[i + 2]->op == GGML_OP_GLU &&
+        cgraph->nodes[i + 3]->op == GGML_OP_MUL_MAT_ID &&
+        cgraph->nodes[i + 4]->op == GGML_OP_MUL) {
+
+        ggml_tensor * glu  = cgraph->nodes[i + 2];
+        ggml_tensor * down = cgraph->nodes[i + 3];
+        ggml_tensor * mul  = cgraph->nodes[i + 4];
+
+        static const bool ffn_enabled = getenv("GGML_CUDA_CUTLASS_MOE_PREFILL") != nullptr &&
+                                        getenv("GGML_CUDA_CUTLASS_MOE_NO_FFN") == nullptr;
+        static const int ffn_min_tokens = [] {
+            const char * s = getenv("GGML_CUDA_CUTLASS_MOE_PREFILL_MIN");
+            return s ? atoi(s) : 1024;
+        }();
+
+        ggml_tensor * gate_n = nullptr, * up_n = nullptr;
+        if (glu->src[1] != nullptr && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU) {
+            if (glu->src[0] == cgraph->nodes[i] && glu->src[1] == cgraph->nodes[i + 1]) {
+                gate_n = cgraph->nodes[i]; up_n = cgraph->nodes[i + 1];
+            } else if (glu->src[0] == cgraph->nodes[i + 1] && glu->src[1] == cgraph->nodes[i]) {
+                gate_n = cgraph->nodes[i + 1]; up_n = cgraph->nodes[i];
+            }
+        }
+
+        const ggml_tensor * ids = gate_n ? gate_n->src[2] : nullptr;
+        const ggml_tensor * w   = mul->src[1];
+        bool ok = ffn_enabled && gate_n &&
+            down->src[1] == glu && mul->src[0] == down &&
+            gate_n->src[0]->type == GGML_TYPE_NVFP4 &&
+            up_n->src[0]->type   == GGML_TYPE_NVFP4 &&
+            down->src[0]->type   == GGML_TYPE_NVFP4 &&
+            gate_n->src[1] == up_n->src[1] && up_n->src[2] == ids && down->src[2] == ids &&
+            gate_n->src[1]->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 &&
+            w->type == GGML_TYPE_F32 &&
+            !ggml_backend_buft_is_cuda_split(gate_n->src[0]->buffer->buft) &&
+            !ggml_backend_buft_is_cuda_split(up_n->src[0]->buffer->buft) &&
+            !ggml_backend_buft_is_cuda_split(down->src[0]->buffer->buft) &&
+            // dims: gate/up [K, N_gu, E]; down [N_gu, N_out, E]
+            gate_n->src[0]->ne[0] == up_n->src[0]->ne[0] &&
+            gate_n->src[0]->ne[1] == up_n->src[0]->ne[1] &&
+            gate_n->src[0]->ne[1] == down->src[0]->ne[0] &&
+            gate_n->src[0]->ne[2] == down->src[0]->ne[2] &&
+            gate_n->src[1]->ne[1] == 1 && gate_n->src[1]->ne[3] == 1 &&
+            ids->nb[0] == ggml_element_size(ids);
+
+        const int64_t n_tokens = ok ? down->ne[2] : 0;
+        const int     neu      = ok ? (int) ids->ne[0] : 0;
+        ok = ok && n_tokens >= ffn_min_tokens && neu >= 1 && neu <= 16 &&
+            // w must be [1, neu, n_tokens] contiguous (flat ids_dst indexing)
+            w->ne[0] == 1 && w->ne[1] == neu && w->ne[2] == n_tokens && w->ne[3] == 1 &&
+            ggml_is_contiguous(w) && ggml_is_contiguous(mul) && down->ne[1] == neu;
+
+        if (ok) {
+            // optional expert-sum chain: neu VIEWs of mul + (neu-1) ADDs
+            ggml_tensor * out = nullptr;
+            int extra = 0;
+            if (neu >= 2 && i + 4 + neu + (neu - 1) < cgraph->n_nodes) {
+                bool chain_ok = true;
+                for (int v = 0; v < neu && chain_ok; ++v) {
+                    const ggml_tensor * vw = cgraph->nodes[i + 5 + v];
+                    chain_ok = vw->op == GGML_OP_VIEW && vw->src[0] == mul;
+                }
+                for (int a = 0; a < neu - 1 && chain_ok; ++a) {
+                    const ggml_tensor * ad = cgraph->nodes[i + 5 + neu + a];
+                    chain_ok = ad->op == GGML_OP_ADD &&
+                        ad->src[0] == (a == 0 ? cgraph->nodes[i + 5] : cgraph->nodes[i + 5 + neu + a - 1]) &&
+                        ad->src[1] == cgraph->nodes[i + 5 + a + 1];
+                }
+                if (chain_ok) {
+                    ggml_tensor * cand = cgraph->nodes[i + 4 + neu + (neu - 1)];
+                    if (ggml_is_contiguous(cand) && cand->type == GGML_TYPE_F32 &&
+                        cand->ne[0] == mul->ne[0] && cand->ne[1] == n_tokens && cand->ne[2] == 1) {
+                        std::vector<ggml_op> ops = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU,
+                                                     GGML_OP_MUL_MAT_ID, GGML_OP_MUL };
+                        for (int v = 0; v < neu; ++v)     ops.push_back(GGML_OP_VIEW);
+                        for (int a = 0; a < neu - 1; ++a) ops.push_back(GGML_OP_ADD);
+                        const int i_out = i + 4 + neu + (neu - 1);
+                        if (ggml_can_fuse_subgraph(cgraph, i, (int) ops.size(), ops.data(), &i_out, 1)) {
+                            out   = cand;
+                            extra = neu + (neu - 1);
+                        }
+                    }
+                }
+            }
+            if (!out) {
+                const std::vector<ggml_op> ops = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU,
+                                                   GGML_OP_MUL_MAT_ID, GGML_OP_MUL };
+                const int i_out = i + 4;
+                if (!ggml_can_fuse_subgraph(cgraph, i, (int) ops.size(), ops.data(), &i_out, 1)) {
+                    ok = false;
+                }
+            }
+            if (ok) {
+                const ggml_tensor * src1 = gate_n->src[1];
+                cudaStream_t stream = cuda_ctx->stream();
+                ggml_cuda_moe_ids_args ids_args = {
+                    (const int32_t *) ids->data,
+                    (int) gate_n->src[0]->ne[2], (int) n_tokens, neu, (int) src1->ne[1],
+                    (int) (ids->nb[1] / ggml_element_size(ids)),
+                    (int) (src1->nb[2] / src1->nb[1]),
+                };
+                ggml_tensor * dst_t = out ? out : mul;
+                const int accum_neu = out ? neu : 0;
+                const int64_t s11 = src1->nb[1]  / ggml_type_size(src1->type);
+                const int64_t s1  = dst_t->nb[1] / ggml_type_size(dst_t->type);
+                const int rc = ggml_cuda_cutlass_moe_nvfp4_ffn(
+                    gate_n->src[0]->data, up_n->src[0]->data, down->src[0]->data,
+                    (const float *) src1->data, &ids_args, (float *) dst_t->data,
+                    (int) gate_n->src[0]->ne[2], (int) gate_n->src[0]->ne[1],
+                    (int) gate_n->src[0]->ne[0], (int) down->src[0]->ne[1],
+                    (int) (n_tokens * neu), s11, s1,
+                    gate_n->src[0]->nb[1], gate_n->src[0]->nb[2],
+                    up_n->src[0]->nb[1],   up_n->src[0]->nb[2],
+                    down->src[0]->nb[1],   down->src[0]->nb[2],
+                    (const float *) w->data, accum_neu, stream);
+                CUDA_CHECK(cudaGetLastError());
+                if (rc == 0) {
+                    if (getenv("FCMOE_DEBUG")) {
+                        static bool once = false;
+                        if (!once) {
+                            once = true;
+                            fprintf(stderr, "[FCMOE] WHOLE-FFN fusion ACTIVE (gate+up+swiglu+down%s)\n",
+                                    out ? "+expert-sum" : "");
+                            fflush(stderr);
+                        }
+                    }
+                    return 4 + extra;
+                }
+            }
+        }
+    }
+
     // MUL_MAT_ID + routing-weight MUL (+ optional VIEWxN + ADDx(N-1) expert sum)
     // -> CUTLASS bridge with fused scatter epilogue
     if (node->op == GGML_OP_MUL_MAT_ID && i + 1 < cgraph->n_nodes &&

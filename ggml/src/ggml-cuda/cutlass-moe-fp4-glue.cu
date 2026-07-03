@@ -380,6 +380,111 @@ __global__ void k_gather_quant(
     }
 }
 
+// Fused SwiGLU + NVFP4 requant on SORTED rows (whole-FFN fusion path).
+// Row m: x[j] = silu(g*gate[m][j]) * (g*up[m][j]); then quantize x to NVFP4
+// exactly like k_gather_quant pass 2 (same swizzle, same sf_offsets layout,
+// K2 = N_gu). Replaces: scatter(gate) + scatter(up) + silu + gather_quant.
+__global__ void k_swiglu_quant(
+        const uint16_t * __restrict__ dg, const uint16_t * __restrict__ du,
+        const float * __restrict__ row_scale1,
+        const int32_t * __restrict__ expert_bounds, const int32_t * __restrict__ sf_offsets,
+        float * __restrict__ row_scale2, uint8_t * __restrict__ a_e2m1, uint8_t * __restrict__ sfa,
+        int E, int Mtot, int K, int numKTiles) {
+    const int m = blockIdx.x;
+    if (m >= Mtot) return;
+    extern __shared__ float srow[];               // K floats + 32 reduce slots
+    float * red = srow + K;
+    const float g1 = row_scale1[m];
+    const uint16_t * grow_ = dg + (size_t) m * K;
+    const uint16_t * urow_ = du + (size_t) m * K;
+    float amax = 0.f;
+    for (int j = threadIdx.x; j < K; j += blockDim.x) {
+        uint32_t bg = (uint32_t) grow_[j] << 16, bu = (uint32_t) urow_[j] << 16;
+        float xg, xu; memcpy(&xg, &bg, 4); memcpy(&xu, &bu, 4);
+        xg *= g1; xu *= g1;
+        const float v = (xg / (1.0f + expf(-xg))) * xu;   // silu(gate)*up
+        srow[j] = v;
+        amax = fmaxf(amax, fabsf(v));
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off));
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = amax;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        const int nwarp = (blockDim.x + 31) >> 5;
+        float a = threadIdx.x < nwarp ? red[threadIdx.x] : 0.f;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, off));
+        if (threadIdx.x == 0) red[0] = a;
+    }
+    __syncthreads();
+    const float g = red[0] > 0.f ? red[0] / 2688.0f : 1.0f;
+    if (threadIdx.x == 0) row_scale2[m] = g;
+    const float invg = 1.0f / g;
+
+    int lo = 0, hi = E - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (expert_bounds[mid] <= m) lo = mid; else hi = mid - 1;
+    }
+    const int e = lo;
+    const int r = m - expert_bounds[e];
+    uint8_t * sfa_e   = sfa + (size_t) sf_offsets[e] * (K / QK_NVFP4_SUB);
+    uint8_t * out_row = a_e2m1 + (size_t) m * (K / 2);
+
+    const int nsubK = K / QK_NVFP4_SUB;
+    for (int gsub = threadIdx.x; gsub < nsubK; gsub += blockDim.x) {
+        const float * xb = srow + gsub * QK_NVFP4_SUB;
+        float sub_amax = 0.f;
+#pragma unroll
+        for (int j = 0; j < QK_NVFP4_SUB; j++)
+            sub_amax = fmaxf(sub_amax, fabsf(xb[j] * invg));
+        const uint8_t ue = d_fp32_to_ue4m3(sub_amax / 6.0f);
+        const float scale = d_ue4m3_to_fp32_std(ue);
+        sfa_e[d_sf_swizzle(r, gsub, numKTiles)] = ue;
+        const int out_base = gsub * (QK_NVFP4_SUB / 2);
+#if __CUDA_ARCH__ >= 1200
+        const float invs = invg / scale;
+#pragma unroll
+        for (int b = 0; b < QK_NVFP4_SUB / 2; b++) {
+            uint32_t byte_;
+            asm volatile("{\n\t.reg .b8 b8;\n\t"
+                         "cvt.rn.satfinite.e2m1x2.f32 b8, %2, %1;\n\t"
+                         "cvt.u32.u8 %0, b8;\n\t}"
+                         : "=r"(byte_)
+                         : "f"(xb[2 * b] * invs), "f"(xb[2 * b + 1] * invs));
+            out_row[out_base + b] = (uint8_t) byte_;
+        }
+#else
+#pragma unroll
+        for (int b = 0; b < QK_NVFP4_SUB / 2; b++) {
+            const uint8_t c0 = d_e2m1_code(xb[2 * b]     * invg, scale);
+            const uint8_t c1 = d_e2m1_code(xb[2 * b + 1] * invg, scale);
+            out_row[out_base + b] = c0 | (c1 << 4);
+        }
+#endif
+    }
+}
+
+extern "C" void ggml_cuda_nvfp4_swiglu_quant(
+        const void * d_gate_bf16, const void * d_up_bf16, const float * row_scale1,
+        const int32_t * expert_bounds, const int32_t * sf_offsets,
+        float * row_scale2, void * a_e2m1, void * sfa,
+        int E, int Mtot, int K, cudaStream_t stream) {
+    const int threads = 256;
+    const int numKTiles = (K + 63) / 64;
+    const size_t smem = (size_t) K * sizeof(float) + 32 * sizeof(float);
+    if (smem > 48 * 1024) {
+        cudaFuncSetAttribute(k_swiglu_quant, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+    }
+    k_swiglu_quant<<<(unsigned) Mtot, threads, smem, stream>>>(
+        (const uint16_t *) d_gate_bf16, (const uint16_t *) d_up_bf16, row_scale1,
+        expert_bounds, sf_offsets, row_scale2,
+        (uint8_t *) a_e2m1, (uint8_t *) sfa, E, Mtot, K, numKTiles);
+}
+
 extern "C" void ggml_cuda_nvfp4_gather_quant(
         const float * src1, const int32_t * ids_src1, const int32_t * expert_bounds,
         const int32_t * sf_offsets, float * row_scale, void * a_e2m1, void * sfa,
