@@ -397,6 +397,12 @@ static void * grow(void ** p, size_t * cap, size_t need) {
 static const float * s_a_src1 = nullptr;
 static uint64_t s_a_gen = 0; static int s_a_K = -1, s_a_M = -1;
 
+// Dense-path A-reuse cache: Q/K/V attention projections consume the SAME
+// src1 activations (same M,K) back-to-back -> identical quantized A/SFA/G.
+// Invalidated whenever the MoE paths clobber the shared dAq/dSFA/dG scratch.
+static const float * s_d_src1 = nullptr;
+static int s_d_K = -1, s_d_M = -1;
+
 // forward decl (defined below)
 extern "C" int ggml_cuda_cutlass_moe_nvfp4_prefill(
         const void * w_blocks, const float * src1, const ggml_cuda_moe_ids_args * ids,
@@ -429,11 +435,16 @@ extern "C" int ggml_cuda_cutlass_dense_nvfp4(
     // device bounds/sf_off for E=1: [0, M], [0]
     static int32_t * dB1 = nullptr;
     if (!dB1) cudaMalloc(&dB1, 3 * sizeof(int32_t));
-    { const int32_t h[3] = {0, M, 0};
-      cudaMemcpyAsync(dB1, h, sizeof(h), cudaMemcpyHostToDevice, stream); }
-    cudaMemsetAsync(g_pf.dSFA, 0, sf_rows * (K / QSUB), stream);
-    ggml_cuda_nvfp4_gather_quant(src1, /*ids_src1=*/nullptr, dB1, dB1 + 2,
-                                 g_pf.dG, g_pf.dAq, g_pf.dSFA, 1, M, K, s11, stream);
+    // Q/K/V projections share src1 -> reuse quantized A operand across calls
+    const bool d_reuse = s_d_src1 == src1 && s_d_K == K && s_d_M == M;
+    if (!d_reuse) {
+        const int32_t h[3] = {0, M, 0};
+        cudaMemcpyAsync(dB1, h, sizeof(h), cudaMemcpyHostToDevice, stream);
+        cudaMemsetAsync(g_pf.dSFA, 0, sf_rows * (K / QSUB), stream);
+        ggml_cuda_nvfp4_gather_quant(src1, /*ids_src1=*/nullptr, dB1, dB1 + 2,
+                                     g_pf.dG, g_pf.dAq, g_pf.dSFA, 1, M, K, s11, stream);
+        s_d_src1 = src1; s_d_K = K; s_d_M = M;
+    }
     k_build_group_args<<<1, 1, 0, stream>>>(
         dB1, dB1 + 2, (const uint8_t *) wc.dB, (const uint8_t *) wc.dSFB,
         g_pf.dAq, g_pf.dSFA, g_pf.dD,
@@ -523,6 +534,7 @@ extern "C" int ggml_cuda_cutlass_moe_nvfp4_prefill(
         ggml_cuda_nvfp4_gather_quant(src1, ids_src1, expert_bounds, g_pf.sf_off,
                                      g_pf.dG, g_pf.dAq, g_pf.dSFA, E, Mtot, K, s11, stream);
         s_a_src1 = src1; s_a_gen = routing_gen; s_a_K = K; s_a_M = Mtot;
+        s_d_src1 = nullptr; // dense A-cache clobbered
     }
     {
         const int threads = 128;
@@ -676,6 +688,7 @@ extern "C" int ggml_cuda_cutlass_moe_nvfp4_ffn(
     grow((void **) &g_pf.dD2,  &g_pf.d2_cap,  (size_t) Mtot * N_gu * sizeof(ElementD));
     grow((void **) &g_pf.dD,   &g_pf.d_cap,   (size_t) Mtot * N_out * sizeof(ElementD));
     s_a_src1 = nullptr;   // we clobber dAq/dSFA/dG below
+    s_d_src1 = nullptr;   // dense A-cache clobbered too
 
     // ---- input quant (once for gate AND up) ----
     ggml_cuda_nvfp4_sf_offsets(bounds, g_pf.sf_off, E, stream);
