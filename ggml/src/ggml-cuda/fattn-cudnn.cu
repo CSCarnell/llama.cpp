@@ -22,6 +22,7 @@
 #ifdef GGML_CUDA_USE_CUDNN
 
 #include <cudnn_frontend.h>
+#include <cuda_fp8.h>
 
 #include <atomic>
 #include <cmath>
@@ -58,6 +59,117 @@ static __global__ void k_fcfa_o_f16_to_f32(const half * __restrict__ src, float 
     if (i < n) {
         dst[i] = __half2float(src[i]);
     }
+}
+
+
+// ================= FP8 (E4M3) attention staging (GGML_CUDA_CUDNN_FA_FP8) =====
+// Per-tensor dynamic amax scaling: amax(|X|) -> scale = 448/amax quantizes to
+// E4M3, descale = amax/448 restores magnitude inside cuDNN. Softmax probs P in
+// [0,1] use a fixed scale_s=448. O is emitted in HALF (scale_o=1) so there is
+// no output-side FP8 precision loss and the existing o_f16->f32 stage is reused.
+#define FCFA_E4M3_MAX 448.0f
+
+// atomicMax on the int bit-pattern is monotonic for non-negative floats.
+static __device__ __forceinline__ void fcfa_atomic_max_pos(float * addr, float v) {
+    atomicMax((int *) addr, __float_as_int(v));
+}
+
+// amax over strided F32 [d,n,h] view (Q).
+static __global__ void k_fcfa_amax_f32(
+        const char * __restrict__ src, float * __restrict__ amax,
+        const int64_t d, const int64_t n, const int64_t h,
+        const int64_t nb1, const int64_t nb2) {
+    const int64_t total = d*n*h;
+    float m = 0.0f;
+    for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < total;
+         i += (int64_t) gridDim.x*blockDim.x) {
+        const int64_t x = i % d;
+        const int64_t hh = (i / d) % h;
+        const int64_t s = i / (d*h);
+        const float * p = (const float *) (src + s*nb1 + hh*nb2);
+        m = fmaxf(m, fabsf(p[x]));
+    }
+    __shared__ float sm[256];
+    sm[threadIdx.x] = m; __syncthreads();
+    for (int o = blockDim.x/2; o > 0; o >>= 1) {
+        if (threadIdx.x < (unsigned) o) sm[threadIdx.x] = fmaxf(sm[threadIdx.x], sm[threadIdx.x+o]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) fcfa_atomic_max_pos(amax, sm[0]);
+}
+
+// amax over strided F16 [d,n,h] view (K/V), base already offset by band_lo.
+static __global__ void k_fcfa_amax_f16(
+        const half * __restrict__ base, float * __restrict__ amax,
+        const int64_t d, const int64_t n, const int64_t h,
+        const int64_t nb1, const int64_t nb2) { // element strides
+    const int64_t total = d*n*h;
+    float m = 0.0f;
+    for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < total;
+         i += (int64_t) gridDim.x*blockDim.x) {
+        const int64_t x = i % d;
+        const int64_t hh = (i / d) % h;
+        const int64_t s = i / (d*h);
+        m = fmaxf(m, fabsf(__half2float(base[s*nb1 + hh*nb2 + x])));
+    }
+    __shared__ float sm[256];
+    sm[threadIdx.x] = m; __syncthreads();
+    for (int o = blockDim.x/2; o > 0; o >>= 1) {
+        if (threadIdx.x < (unsigned) o) sm[threadIdx.x] = fmaxf(sm[threadIdx.x], sm[threadIdx.x+o]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) fcfa_atomic_max_pos(amax, sm[0]);
+}
+
+// Turn the three amaxes into cuDNN descale/scale scalars + the quantize scales.
+// layout: ds[0..2]=descale q,k,v  ds[3]=descale_s ds[4]=scale_s ds[5]=scale_o
+//         qs[0..2]=quant scale q,k,v (448/amax)
+static __global__ void k_fcfa_make_scales(const float * __restrict__ amax,
+        float * __restrict__ ds, float * __restrict__ qs) {
+    const float aq = fmaxf(amax[0], 1e-6f);
+    const float ak = fmaxf(amax[1], 1e-6f);
+    const float av = fmaxf(amax[2], 1e-6f);
+    ds[0] = aq / FCFA_E4M3_MAX; ds[1] = ak / FCFA_E4M3_MAX; ds[2] = av / FCFA_E4M3_MAX;
+    ds[3] = 1.0f / FCFA_E4M3_MAX;   // descale_s (P in [0,1] stored *448)
+    ds[4] = FCFA_E4M3_MAX;          // scale_s
+    ds[5] = FCFA_E4M3_MAX / av;     // scale_o: |O| <= amax_v, so reuse V range (O is E4M3)
+    qs[0] = FCFA_E4M3_MAX / aq; qs[1] = FCFA_E4M3_MAX / ak; qs[2] = FCFA_E4M3_MAX / av;
+}
+
+// Dequantize E4M3 O [s][h][dv] -> f32 dst. descale = 1/scale_o = amax_v/448 = ds[2].
+static __global__ void k_fcfa_o_fp8_to_f32(const __nv_fp8_e4m3 * __restrict__ src,
+        float * __restrict__ dst, const int64_t n, const float * __restrict__ descale) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = (float) src[i] * descale[0];
+    }
+}
+
+// Quantize strided F32 [d,n_q,h_q] view -> contiguous E4M3 [s][h][d].
+static __global__ void k_fcfa_q_f32_to_fp8(
+        const char * __restrict__ src, __nv_fp8_e4m3 * __restrict__ dst,
+        const int64_t d, const int64_t n_q, const int64_t h_q,
+        const int64_t nb1, const int64_t nb2, const float * __restrict__ qscale) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= d*n_q*h_q) return;
+    const int64_t x = i % d;
+    const int64_t h = (i / d) % h_q;
+    const int64_t s = i / (d*h_q);
+    const float * p = (const float *) (src + s*nb1 + h*nb2);
+    dst[i] = __nv_fp8_e4m3(p[x] * qscale[0]);
+}
+
+// Quantize strided F16 [d,n_kv,h_k] view (base offset) -> contiguous E4M3 [s][h][d].
+static __global__ void k_fcfa_kv_f16_to_fp8(
+        const half * __restrict__ base, __nv_fp8_e4m3 * __restrict__ dst,
+        const int64_t d, const int64_t n_kv, const int64_t h_k,
+        const int64_t nb1, const int64_t nb2, const float * __restrict__ qscale, const int qidx) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= d*n_kv*h_k) return;
+    const int64_t x = i % d;
+    const int64_t h = (i / d) % h_k;
+    const int64_t s = i / (d*h_k);
+    dst[i] = __nv_fp8_e4m3(__half2float(base[s*nb1 + h*nb2 + x]) * qscale[qidx]);
 }
 
 // Mask probe: per q-row, find the lowest/highest allowed KV index and the
@@ -169,7 +281,165 @@ static bool fcfa_log_enabled() {
 
 // ---------------------------------------------------------------- impl
 
-enum fcfa_uids : int64_t { UID_Q = 1, UID_K, UID_V, UID_O, UID_SEQ_Q = 7, UID_SEQ_KV };
+enum fcfa_uids : int64_t { UID_Q = 1, UID_K, UID_V, UID_O, UID_SEQ_Q = 7, UID_SEQ_KV,
+    // FP8 path scalars/outputs
+    UID_DQ = 10, UID_DK, UID_DV, UID_DS, UID_SS, UID_SO, UID_AMAX_S, UID_AMAX_O };
+
+// ---------------------------------------------------------------- FP8 path
+// Isolated E4M3 attention path (GGML_CUDA_CUDNN_FA_FP8). Own graph cache so the
+// validated HALF path is byte-for-byte untouched. Q/K/V are dynamically
+// per-tensor amax-scaled into E4M3, cuDNN runs sdpa_fp8, O is emitted HALF
+// (scale_o=1) and dequantized with the shared o_f16->f32 stage.
+static bool fcfa_run_fp8(
+        ggml_backend_cuda_context & ctx, fcfa_state & st, ggml_tensor * dst,
+        const ggml_tensor * Q, const ggml_tensor * K, const ggml_tensor * V,
+        int32_t band_lo, int32_t seq_kv, int64_t dim_kv, float scale,
+        int64_t n_q, int64_t h_q, int64_t h_k, int64_t d, int64_t dv, cudaStream_t stream) {
+    static std::map<fcfa_graph_key, fcfa_graph_entry> g_fp8_graphs;
+
+    // FP8 sdpa engines support causal-bottom-right, NOT the padding-mask+seq_len
+    // variant. So use the EXACT key window [band_lo, band_lo+seq_kv) with no
+    // bucketing; bottom-right causal reproduces row i -> keys [0, n_past+i].
+    const int64_t dim_kv_fp8 = seq_kv;
+    GGML_UNUSED(dim_kv);
+    const int64_t k_nb1 = (int64_t) (K->nb[1]/sizeof(half));
+    const int64_t k_nb2 = (int64_t) (K->nb[2]/sizeof(half));
+    const int64_t v_nb1 = (int64_t) (V->nb[1]/sizeof(half));
+    const int64_t v_nb2 = (int64_t) (V->nb[2]/sizeof(half));
+
+    fcfa_graph_key key = {};
+    key.n_q  = n_q;  key.n_kv = dim_kv_fp8;
+    key.h_q  = h_q;  key.h_k  = h_k;
+    key.d    = d;    key.dv   = dv;
+    key.q_nb1 = 0;   key.q_nb2 = 0;
+    key.k_nb1 = k_nb1; key.k_nb2 = k_nb2;
+    key.v_nb1 = v_nb1; key.v_nb2 = v_nb2;
+    memcpy(&key.scale_bits, &scale, sizeof(scale));
+
+    auto it = g_fp8_graphs.find(key);
+    if (it == g_fp8_graphs.end()) {
+        fcfa_graph_entry ent;
+        auto graph = std::make_shared<fe::graph::Graph>();
+        graph->set_io_data_type(fe::DataType_t::FP8_E4M3)
+             .set_intermediate_data_type(fe::DataType_t::FLOAT)
+             .set_compute_data_type(fe::DataType_t::FLOAT);
+        // Q/K/V staged contiguous interleaved [s][h][d], E4M3.
+        auto Qt = graph->tensor(fe::graph::Tensor_attributes().set_uid(UID_Q)
+            .set_dim({1, h_q, n_q, d}).set_stride({d*n_q*h_q, d, d*h_q, 1}));
+        auto Kt = graph->tensor(fe::graph::Tensor_attributes().set_uid(UID_K)
+            .set_dim({1, h_k, dim_kv_fp8, d}).set_stride({d*dim_kv_fp8*h_k, d, d*h_k, 1}));
+        auto Vt = graph->tensor(fe::graph::Tensor_attributes().set_uid(UID_V)
+            .set_dim({1, h_k, dim_kv_fp8, d}).set_stride({d*dim_kv_fp8*h_k, d, d*h_k, 1}));
+        auto mkscalar = [&](int64_t uid) {
+            return graph->tensor(fe::graph::Tensor_attributes().set_uid(uid)
+                .set_dim({1,1,1,1}).set_stride({1,1,1,1}).set_data_type(fe::DataType_t::FLOAT));
+        };
+        auto dq = mkscalar(UID_DQ), dk = mkscalar(UID_DK), dvv = mkscalar(UID_DV);
+        auto ds = mkscalar(UID_DS), ss = mkscalar(UID_SS), so = mkscalar(UID_SO);
+
+        auto opts = fe::graph::SDPA_fp8_attributes()
+            .set_generate_stats(false)
+            .set_causal_mask_bottom_right(true)
+            .set_attn_scale(scale);
+
+        auto [Ot, stats, amax_s, amax_o] = graph->sdpa_fp8(Qt, Kt, Vt, dq, dk, dvv, ds, ss, so, opts);
+        GGML_UNUSED(stats);
+        // O is E4M3 (io default), scaled by scale_o=448/amax_v; dequantized to f32.
+        Ot->set_output(true).set_uid(UID_O)
+          .set_dim({1, h_q, n_q, dv}).set_stride({dv*n_q*h_q, dv, dv*h_q, 1});
+        amax_s->set_output(true).set_uid(UID_AMAX_S).set_data_type(fe::DataType_t::FLOAT)
+          .set_dim({1,1,1,1}).set_stride({1,1,1,1});
+        amax_o->set_output(true).set_uid(UID_AMAX_O).set_data_type(fe::DataType_t::FLOAT)
+          .set_dim({1,1,1,1}).set_stride({1,1,1,1});
+
+        auto bst = graph->build(st.handle, {fe::HeurMode_t::A});
+        if (!bst.is_good()) {
+            ent.build_failed = true;
+            if (fcfa_log_enabled()) {
+                fprintf(stderr, "[FCFA-cuDNN-FP8] graph build FAILED (n_q=%ld dim_kv=%ld): %s\n",
+                    (long) n_q, (long) dim_kv, bst.get_message().c_str());
+            }
+        } else {
+            ent.graph = graph;
+            (void) graph->get_workspace_size(ent.ws_size);
+            if (fcfa_log_enabled()) {
+                fprintf(stderr, "[FCFA-cuDNN-FP8] graph built n_q=%ld dim_kv=%ld ws=%.1f MB\n",
+                    (long) n_q, (long) dim_kv, ent.ws_size/1048576.0);
+            }
+        }
+        it = g_fp8_graphs.emplace(key, std::move(ent)).first;
+    }
+    if (it->second.build_failed) {
+        return false;
+    }
+    const fcfa_graph_entry & ent = it->second;
+
+    // ---- staging + execute ----
+    ggml_cuda_pool_alloc<__nv_fp8_e4m3> q_fp8(ctx.pool(), d*n_q*h_q);
+    ggml_cuda_pool_alloc<__nv_fp8_e4m3> k_fp8(ctx.pool(), d*dim_kv_fp8*h_k);
+    ggml_cuda_pool_alloc<__nv_fp8_e4m3> v_fp8(ctx.pool(), d*dim_kv_fp8*h_k);
+    ggml_cuda_pool_alloc<__nv_fp8_e4m3> o_fp8(ctx.pool(), dv*n_q*h_q);
+    ggml_cuda_pool_alloc<float>         amax (ctx.pool(), 3);
+    ggml_cuda_pool_alloc<float>         dsb  (ctx.pool(), 6); // descale q,k,v,s + scale_s + scale_o
+    ggml_cuda_pool_alloc<float>         qsb  (ctx.pool(), 3); // quant scales q,k,v
+    ggml_cuda_pool_alloc<float>         amo  (ctx.pool(), 2); // amax_s, amax_o sinks
+    ggml_cuda_pool_alloc<char>          ws;
+    if (ent.ws_size > 0) {
+        ws.alloc(ctx.pool(), ent.ws_size);
+    }
+
+    const half * base_k = (const half *) ((const char *) K->data + (int64_t) band_lo*K->nb[1]);
+    const half * base_v = (const half *) ((const char *) V->data + (int64_t) band_lo*V->nb[1]);
+
+    CUDA_CHECK(cudaMemsetAsync(amax.get(), 0, 3*sizeof(float), stream));
+    // amax reductions (fixed grid; grid-stride covers the whole view)
+    k_fcfa_amax_f32<<<256, 256, 0, stream>>>((const char *) Q->data, amax.get() + 0,
+        d, n_q, h_q, (int64_t) Q->nb[1], (int64_t) Q->nb[2]);
+    k_fcfa_amax_f16<<<256, 256, 0, stream>>>(base_k, amax.get() + 1, d, dim_kv_fp8, h_k, k_nb1, k_nb2);
+    k_fcfa_amax_f16<<<256, 256, 0, stream>>>(base_v, amax.get() + 2, d, dim_kv_fp8, h_k, v_nb1, v_nb2);
+    k_fcfa_make_scales<<<1, 1, 0, stream>>>(amax.get(), dsb.get(), qsb.get());
+    // quantize to E4M3
+    {
+        const int blk = 256;
+        const int64_t nq = d*n_q*h_q, nk = d*dim_kv_fp8*h_k;
+        k_fcfa_q_f32_to_fp8<<<(unsigned) ((nq+blk-1)/blk), blk, 0, stream>>>(
+            (const char *) Q->data, q_fp8.get(), d, n_q, h_q, (int64_t) Q->nb[1], (int64_t) Q->nb[2], qsb.get());
+        k_fcfa_kv_f16_to_fp8<<<(unsigned) ((nk+blk-1)/blk), blk, 0, stream>>>(
+            base_k, k_fp8.get(), d, dim_kv_fp8, h_k, k_nb1, k_nb2, qsb.get(), 1);
+        k_fcfa_kv_f16_to_fp8<<<(unsigned) ((nk+blk-1)/blk), blk, 0, stream>>>(
+            base_v, v_fp8.get(), d, dim_kv_fp8, h_k, v_nb1, v_nb2, qsb.get(), 2);
+    }
+
+    std::unordered_map<int64_t, void *> pack = {
+        {UID_Q,      q_fp8.get()},
+        {UID_K,      k_fp8.get()},
+        {UID_V,      v_fp8.get()},
+        {UID_O,      o_fp8.get()},
+        {UID_DQ,     dsb.get() + 0},
+        {UID_DK,     dsb.get() + 1},
+        {UID_DV,     dsb.get() + 2},
+        {UID_DS,     dsb.get() + 3},
+        {UID_SS,     dsb.get() + 4},
+        {UID_SO,     dsb.get() + 5},
+        {UID_AMAX_S, amo.get() + 0},
+        {UID_AMAX_O, amo.get() + 1},
+    };
+    auto est = ent.graph->execute(st.handle, pack, ent.ws_size > 0 ? (void *) ws.get() : nullptr);
+    if (!est.is_good()) {
+        if (fcfa_log_enabled()) {
+            fprintf(stderr, "[FCFA-cuDNN-FP8] execute FAILED: %s — falling back\n", est.get_message().c_str());
+        }
+        return false;
+    }
+    {
+        const int64_t n = dv*n_q*h_q;
+        const int blk = 256;
+        // dequant O: multiply by 1/scale_o = amax_v/448 = dsb[2] (descale_v)
+        k_fcfa_o_fp8_to_f32<<<(unsigned) ((n + blk - 1)/blk), blk, 0, stream>>>(
+            o_fp8.get(), (float *) dst->data, n, dsb.get() + 2);
+    }
+    return true;
+}
 
 bool ggml_cuda_flash_attn_ext_cudnn_try(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     static const bool disabled = getenv("GGML_CUDA_NO_CUDNN_FA") != nullptr;
@@ -320,6 +590,25 @@ bool ggml_cuda_flash_attn_ext_cudnn_try(ggml_backend_cuda_context & ctx, ggml_te
     int64_t dim_kv = ((int64_t) seq_kv + kv_bucket - 1) & ~(kv_bucket - 1);
     if (dim_kv > kv_rem) {
         dim_kv = kv_rem;
+    }
+
+    // FP8 (E4M3) path — feature-flagged, isolated cache, A/B against HALF baseline.
+    // Adaptive gate: FP8 staging (3x amax + 3x quantize + O dequant per call) only
+    // pays off once attention's quadratic term dominates. Measured crossover ~4k
+    // (pp2048 FP8 slower, pp8192 FP8 +6.3% NVFP4 / +4.4% MXFP4). Below the
+    // threshold, stay on the validated HALF path so FP8 is never a regression.
+    static const bool fcfa_use_fp8 = getenv("GGML_CUDA_CUDNN_FA_FP8") != nullptr;
+    static const int64_t fcfa_fp8_min_kv = [] {
+        const char * s = getenv("GGML_CUDA_CUDNN_FA_FP8_MIN_KV");
+        return s ? atoll(s) : 4096;
+    }();
+    if (fcfa_use_fp8 && (int64_t) seq_kv >= fcfa_fp8_min_kv) {
+        if (fcfa_run_fp8(ctx, st, dst, Q, K, V, band_lo, seq_kv, dim_kv,
+                         scale, n_q, h_q, h_k, d, dv, stream)) {
+            return true;
+        }
+        // fall through to HALF path on any FP8 failure (build/execute) so
+        // correctness/perf is never worse than the validated baseline.
     }
 
     fcfa_graph_key key = {};
