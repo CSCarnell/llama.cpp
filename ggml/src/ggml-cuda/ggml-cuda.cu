@@ -2642,6 +2642,35 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
+#ifdef GGML_CUDA_CUTLASS_FP4
+    // Dense NVFP4 large-batch path: block-scaled FP4 tensor cores (CUTLASS)
+    // instead of MMQ's int8 pipeline. Opt-in via GGML_CUDA_CUTLASS_MOE_PREFILL
+    // (same flag as the MoE path — it is the same engine). Weights repacked
+    // once and cached by pointer.
+    {
+        static const bool cutlass_dense = getenv("GGML_CUDA_CUTLASS_MOE_PREFILL") != nullptr;
+        static const int dense_min_m = [] {
+            const char * s = getenv("GGML_CUDA_CUTLASS_DENSE_MIN");
+            return s ? atoi(s) : 1024;
+        }();
+        if (cutlass_dense && !split && src0->type == GGML_TYPE_NVFP4 &&
+            src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+            src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+            src1->ne[1] >= dense_min_m && ggml_is_contiguous(dst) &&
+            ggml_cuda_cutlass_moe_nvfp4_supported(1, (int) src0->ne[1], (int) src0->ne[0])) {
+            const int64_t s11 = src1->nb[1] / ggml_type_size(src1->type);
+            const int64_t s1  = dst->nb[1]  / ggml_type_size(dst->type);
+            if (ggml_cuda_cutlass_dense_nvfp4(
+                    src0->data, (const float *) src1->data, (float *) dst->data,
+                    (int) src0->ne[1], (int) src0->ne[0], (int) src1->ne[1],
+                    s11, s1, src0->nb[1], src0->nb[2], ctx.stream()) == 0) {
+                CUDA_CHECK(cudaGetLastError());
+                return;
+            }
+        }
+    }
+#endif // GGML_CUDA_CUTLASS_FP4
+
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
     // Therefore, in such cases use cuBLAS.

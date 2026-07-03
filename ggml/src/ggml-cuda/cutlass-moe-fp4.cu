@@ -378,6 +378,70 @@ static void * grow(void ** p, size_t * cap, size_t need) {
     return *p;
 }
 
+// A-operand reuse cache (file scope so the dense path can invalidate it):
+// gate and up projections of one layer consume the SAME activations with the
+// SAME routing -> identical quantized A/SFA/G. Skip the quant pass on reuse.
+static const float * s_a_src1 = nullptr;
+static uint64_t s_a_gen = 0; static int s_a_K = -1, s_a_M = -1;
+
+// ===================== dense NVFP4 path (E=1, identity gather) ==============
+// Routes large-M dense NVFP4 matmuls (attention projections when the model
+// quantizes them to NVFP4) through the same block-scaled FP4 tensor-core GEMM.
+// MMQ handles these by unpacking to int8 tensor cores; FP4 cores are ~2x.
+extern "C" int ggml_cuda_cutlass_dense_nvfp4(
+        const void * w_blocks, const float * src1, float * dst,
+        int N, int K, int M, int64_t s11, int64_t s1,
+        size_t nb01, size_t nb02, cudaStream_t stream) {
+    if (!ggml_cuda_cutlass_moe_nvfp4_supported(1, N, K)) return 1;
+    if (M <= 0) return 1;
+    if ((size_t) K * sizeof(float) + 128 > 96 * 1024) return 1; // gather smem cap
+    if (s1 != N) return 1;                 // direct rowscaled epilogue needs contiguous dst
+    std::lock_guard<std::mutex> lk(g_pf_mtx);
+    const WeightCache & wc = get_repacked_weights(w_blocks, 1, N, K, nb01, nb02, stream);
+    // scratch shared with the MoE prefill path (same stream => ordered, safe),
+    // but the A-reuse cache must be invalidated since dAq is overwritten here.
+    s_a_src1 = nullptr;
+    if (1 > g_pf.E_cap) return 1;          // E-cap scratch built lazily by MoE path; E>=1 always true after first MoE call
+    const size_t sf_rows = (size_t) M + 128;
+    grow((void **) &g_pf.dAq,  &g_pf.aq_cap,  (size_t) M * (K / 2));
+    grow((void **) &g_pf.dSFA, &g_pf.sfa_cap, sf_rows * (K / QSUB));
+    grow((void **) &g_pf.dG,   &g_pf.g_cap,   (size_t) M * sizeof(float));
+    grow((void **) &g_pf.dD,   &g_pf.d_cap,   (size_t) M * N * sizeof(ElementD));
+    // device bounds/sf_off for E=1: [0, M], [0]
+    static int32_t * dB1 = nullptr;
+    if (!dB1) cudaMalloc(&dB1, 3 * sizeof(int32_t));
+    { const int32_t h[3] = {0, M, 0};
+      cudaMemcpyAsync(dB1, h, sizeof(h), cudaMemcpyHostToDevice, stream); }
+    cudaMemsetAsync(g_pf.dSFA, 0, sf_rows * (K / QSUB), stream);
+    ggml_cuda_nvfp4_gather_quant(src1, /*ids_src1=*/nullptr, dB1, dB1 + 2,
+                                 g_pf.dG, g_pf.dAq, g_pf.dSFA, 1, M, K, s11, stream);
+    k_build_group_args<<<1, 1, 0, stream>>>(
+        dB1, dB1 + 2, (const uint8_t *) wc.dB, (const uint8_t *) wc.dSFB,
+        g_pf.dAq, g_pf.dSFA, g_pf.dD,
+        g_pf.ps, g_pf.pA, g_pf.pB, g_pf.pC, g_pf.pD, g_pf.pSFA, g_pf.pSFB,
+        g_pf.sa, g_pf.sb, g_pf.sc, g_pf.sd, g_pf.la, g_pf.lb, 1, N, K);
+    static cutlass::KernelHardwareInfo hw = [] {
+        cutlass::KernelHardwareInfo h; h.device_id = 0;
+        h.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
+        return h;
+    }();
+    typename Gemm::Arguments args;
+    args.mode = cutlass::gemm::GemmUniversalMode::kGrouped;
+    args.problem_shape = {1, g_pf.ps, nullptr};
+    args.mainloop = { g_pf.pA, g_pf.sa, g_pf.pB, g_pf.sb, g_pf.pSFA, g_pf.la, g_pf.pSFB, g_pf.lb };
+    decltype(args.epilogue.thread) fusion; fusion.alpha = 1.0f; fusion.beta = 0.0f;
+    args.epilogue = { fusion, g_pf.pC, g_pf.sc, g_pf.pD, g_pf.sd };
+    args.hw_info = hw;
+    Gemm gemm;
+    const size_t wssz = Gemm::get_workspace_size(args);
+    grow(&g_pf.ws, &g_pf.ws_cap, wssz ? wssz : 1);
+    if (gemm.can_implement(args) != cutlass::Status::kSuccess) return 2;
+    if (gemm.initialize(args, g_pf.ws, stream) != cutlass::Status::kSuccess) return 3;
+    if (gemm.run(stream) != cutlass::Status::kSuccess) return 4;
+    ggml_cuda_bf16_to_f32_rowscaled((const uint16_t *) g_pf.dD, dst, g_pf.dG, M, N, stream);
+    return 0;
+}
+
 extern "C" int ggml_cuda_cutlass_moe_nvfp4_prefill(
         const void * w_blocks, const float * src1, const ggml_cuda_moe_ids_args * ids,
         float * dst, int E, int N, int K, int Mtot, int64_t s11, int64_t s1,
@@ -430,9 +494,8 @@ extern "C" int ggml_cuda_cutlass_moe_nvfp4_prefill(
     // A-operand reuse: gate and up projections of one layer consume the SAME
     // activations with the SAME routing -> identical quantized A/SFA/G. Skip
     // the whole quant pass on the second call (measured: k_gather_quant was
-    // ~5-8% of prefill GPU time; this halves it).
-    static const float * s_a_src1 = nullptr;
-    static uint64_t s_a_gen = 0; static int s_a_K = -1, s_a_M = -1;
+    // ~5-8% of prefill GPU time; this halves it). Cache vars at file scope
+    // (invalidated by the dense path which shares the scratch buffers).
     const bool a_reusable = s_a_src1 == src1 && s_a_gen == routing_gen &&
                             s_a_K == K && s_a_M == Mtot;
     if (!a_reusable) {

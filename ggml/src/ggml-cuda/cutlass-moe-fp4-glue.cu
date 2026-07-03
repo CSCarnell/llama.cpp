@@ -293,7 +293,8 @@ __global__ void k_gather_quant(
     extern __shared__ float srow[];               // K floats + 32 reduce slots
     float * red = srow + K;
 
-    const float * xrow = src1 + (int64_t) ids_src1[m] * s11;
+    // ids_src1 == nullptr -> dense (identity gather): row m reads src1 row m
+    const float * xrow = src1 + (int64_t) (ids_src1 ? ids_src1[m] : m) * s11;
 
     // pass 1: gather + amax (vectorized float4; K % 64 == 0 guaranteed by caller,
     // but xrow alignment depends on s11 — fall back to scalar if not 16B-aligned)

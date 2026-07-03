@@ -33,6 +33,15 @@ int ggml_cuda_cutlass_moe_nvfp4(
 // given shape is supported (N,K multiples of 64, sm120+). Cheap; no allocation.
 int ggml_cuda_cutlass_moe_nvfp4_supported(int E, int N, int K);
 
+// Dense NVFP4 GEMM (E=1, identity gather): dst[M,N] = src1[M,K] @ w[K,N]^T.
+// Routes large-M dense NVFP4 matmuls (e.g. NVFP4 attention projections)
+// through the block-scaled FP4 tensor-core path instead of int8 MMQ.
+// Requires dst contiguous (s1 == N). Returns 0 on success (else fall back).
+int ggml_cuda_cutlass_dense_nvfp4(
+    const void * w_blocks, const float * src1, float * dst,
+    int N, int K, int M, int64_t s11, int64_t s1,
+    size_t nb01, size_t nb02, cudaStream_t stream);
+
 // ZERO-SYNC prefill path (2026-07-02). Fully stream-ordered: no host syncs, no
 // per-call cudaMalloc (persistent grow-only scratch), no src1 materialization.
 // Hooks the mmq.cu mul_mat_id path using its device-side routing arrays:
