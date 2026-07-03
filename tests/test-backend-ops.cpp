@@ -9508,6 +9508,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // FC: PREFILL-shaped cases (large nb) — Qwen3-Coder-30B-A3B attention:
+    // head dim 128, 4 KV heads, GQA 8, causal mask, ub=2048 query blocks.
+    for (int kv : { 2048, 4096, 8192, }) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, kv, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+
     for (int col : {8192, 16384, 32768, 65536, 131072, 262144, 524288}) {
         for (int rows : {1, 4, 16}){
             test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {col, rows, 1, 1}, false,  false,  GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));

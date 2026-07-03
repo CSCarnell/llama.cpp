@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
+#include "fattn-cudnn.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
@@ -584,6 +585,27 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+
+    // FCFA: env-gated shape logger to characterize production FA workloads.
+    static const bool fa_log = getenv("GGML_CUDA_FA_LOG") != nullptr;
+    if (fa_log) {
+        const ggml_tensor * Q = dst->src[0], * K = dst->src[1], * m = dst->src[3];
+        static int64_t n_calls = 0;
+        if (n_calls++ % 48 == 0) { // once per model pass, not per layer
+            fprintf(stderr, "[FCFA] Q[%ld,%ld,%ld,%ld] K[%ld,%ld,%ld,%ld] mask[%ld,%ld,%ld,%ld] prec=%d\n",
+                (long) Q->ne[0], (long) Q->ne[1], (long) Q->ne[2], (long) Q->ne[3],
+                (long) K->ne[0], (long) K->ne[1], (long) K->ne[2], (long) K->ne[3],
+                m ? (long) m->ne[0] : -1, m ? (long) m->ne[1] : -1,
+                m ? (long) m->ne[2] : -1, m ? (long) m->ne[3] : -1,
+                (int) ggml_flash_attn_ext_get_prec(dst));
+        }
+    }
+
+    // FCFA: try the cuDNN SDPA path first for large-batch causal prefill
+    // (1.5-2.0x faster than mma-f16 on Blackwell; falls through when not eligible).
+    if (ggml_cuda_flash_attn_ext_cudnn_try(ctx, dst)) {
+        return;
+    }
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
