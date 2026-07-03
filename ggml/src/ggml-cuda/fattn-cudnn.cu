@@ -236,13 +236,31 @@ bool ggml_cuda_flash_attn_ext_cudnn_try(ggml_backend_cuda_context & ctx, ggml_te
     const uint64_t gen = g_fcfa_gen.load(std::memory_order_relaxed);
     if (!(st.mask_checked && st.mask_gen == gen && st.mask_ptr == mask->data &&
           st.mask_n_q == n_q && st.mask_n_kv == n_kv)) {
-        ggml_cuda_pool_alloc<int32_t> probe(ctx.pool(), 3*n_q);
+        // Probe on a DEDICATED side stream: the mask is a graph INPUT uploaded
+        // by the host before any kernel of this eval runs, so the probe needs
+        // none of the queued main-stream work. Syncing the main stream here
+        // instead was measured to stall the GPU ~4ms per graph eval (the whole
+        // queued pipeline had to drain before the verdict came back).
+        static cudaStream_t probe_stream = [] {
+            cudaStream_t s = nullptr;
+            cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
+            return s;
+        }();
+        // dedicated buffer (NOT ctx.pool(): pool blocks are stream-ordered on the
+        // main stream; writing one from the side stream could race in-flight users)
+        static int32_t * probe_buf = nullptr;
+        static int64_t   probe_cap = 0;
+        if (3*n_q > probe_cap) {
+            if (probe_buf) cudaFree(probe_buf);
+            CUDA_CHECK(cudaMalloc((void **) &probe_buf, 3*n_q*sizeof(int32_t)));
+            probe_cap = 3*n_q;
+        }
         const int64_t row_stride = mask->nb[1]/sizeof(half);
-        k_fcfa_mask_probe<<<n_q, 256, 0, stream>>>(
-            (const half *) mask->data, n_kv, row_stride, probe.get(), probe.get() + n_q, probe.get() + 2*n_q);
+        k_fcfa_mask_probe<<<n_q, 256, 0, probe_stream>>>(
+            (const half *) mask->data, n_kv, row_stride, probe_buf, probe_buf + n_q, probe_buf + 2*n_q);
         st.h_probe.resize(3*n_q);
-        CUDA_CHECK(cudaMemcpyAsync(st.h_probe.data(), probe.get(), 3*n_q*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaMemcpyAsync(st.h_probe.data(), probe_buf, 3*n_q*sizeof(int32_t), cudaMemcpyDeviceToHost, probe_stream));
+        CUDA_CHECK(cudaStreamSynchronize(probe_stream));
 
         const int32_t * lo  = st.h_probe.data();
         const int32_t * hi  = st.h_probe.data() + n_q;
