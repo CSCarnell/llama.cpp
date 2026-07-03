@@ -311,7 +311,7 @@ extern "C" void ggml_cuda_moe_routing_get(
                                                        // reused ids ADDRESS from the next
                                                        // layer can never serve stale data
     if (!hit) {
-        const size_t need = ((size_t) Mtot * 2 + a->n_experts + 1) * sizeof(int32_t);
+        const size_t need = ((size_t) Mtot * 2 + 3 * a->n_experts + 1) * sizeof(int32_t);
         if (need > g_rt.cap) {
             if (g_rt.buf) cudaFree(g_rt.buf);
             cudaMalloc((void **) &g_rt.buf, need + need / 4);
@@ -320,8 +320,19 @@ extern "C" void ggml_cuda_moe_routing_get(
         g_rt.ids_src1 = g_rt.buf;
         g_rt.ids_dst  = g_rt.buf + Mtot;
         g_rt.bounds   = g_rt.buf + 2 * (size_t) Mtot;
-        ggml_cuda_launch_mm_ids_helper(a->ids_data, g_rt.ids_src1, g_rt.ids_dst, g_rt.bounds,
-            a->n_experts, a->n_tokens, a->n_expert_used, a->nchannels_y, a->si1, a->sis1, stream);
+        int32_t * scratch = g_rt.bounds + a->n_experts + 1;   // 2*E ints (counts+cursor)
+        // parallel histogram->scan->scatter routing build (Mtot threads) replaces
+        // mm_ids_helper (1 warp/expert serial token scan; was 5.8% of prefill GPU
+        // time). Within-expert row order is arbitrary — GEMM rows are independent
+        // and scatter/gather address through the same maps. E<=1024 (scan block).
+        if (a->n_experts <= 1024) {
+            ggml_cuda_moe_build_routing(a->ids_data, g_rt.ids_src1, g_rt.ids_dst, g_rt.bounds,
+                scratch, a->n_experts, a->n_tokens, a->n_expert_used, a->nchannels_y,
+                a->si1, a->sis1, stream);
+        } else {
+            ggml_cuda_launch_mm_ids_helper(a->ids_data, g_rt.ids_src1, g_rt.ids_dst, g_rt.bounds,
+                a->n_experts, a->n_tokens, a->n_expert_used, a->nchannels_y, a->si1, a->sis1, stream);
+        }
         g_rt.key_ids = a->ids_data; g_rt.key_tok = a->n_tokens;
         g_rt.key_neu = a->n_expert_used; g_rt.key_E = a->n_experts;
         g_rt.key_ny = a->nchannels_y; g_rt.key_sis1 = a->sis1;

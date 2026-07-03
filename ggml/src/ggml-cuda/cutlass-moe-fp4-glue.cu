@@ -433,6 +433,76 @@ __global__ void k_scatter_rowscaled(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Parallel routing build (2026-07-02): replaces mm_ids_helper for the CUTLASS
+// MoE paths. mm_ids_helper uses ONE WARP PER EXPERT serially scanning all
+// tokens (128 warps total on a 188-SM GPU, ~52us). This is histogram -> scan
+// -> scatter over Mtot threads (~5us). Within-expert row order becomes
+// arbitrary (atomic cursors) — harmless: each GEMM row is independent and both
+// scatter and gather-accum address rows through the same maps.
+// ---------------------------------------------------------------------------
+__global__ void k_route_hist(
+        const int32_t * __restrict__ ids, int32_t * __restrict__ counts,
+        int n_tokens, int neu, int si1) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_tokens * neu) return;
+    const int it  = i / neu;
+    const int iex = i % neu;
+    atomicAdd(&counts[ids[it * si1 + iex]], 1);
+}
+// single block, E <= 1024: exclusive scan counts -> bounds[0..E], zero cursors
+__global__ void k_route_scan(
+        const int32_t * __restrict__ counts, int32_t * __restrict__ bounds,
+        int32_t * __restrict__ cursor, int E) {
+    __shared__ int32_t s[1025];
+    const int e = threadIdx.x;
+    if (e <= E) s[e] = 0;
+    __syncthreads();
+    // simple Hillis-Steele over E entries (E=128 typical: 7 steps)
+    int v = e < E ? counts[e] : 0;
+    s[e + 1] = v;
+    __syncthreads();
+    for (int off = 1; off <= E; off <<= 1) {
+        int add = (e + 1 > off) ? s[e + 1 - off] : 0;
+        __syncthreads();
+        s[e + 1] += add;
+        __syncthreads();
+    }
+    if (e <= E) bounds[e] = s[e];
+    if (e < E)  cursor[e] = 0;
+}
+__global__ void k_route_scatter(
+        const int32_t * __restrict__ ids, const int32_t * __restrict__ bounds,
+        int32_t * __restrict__ cursor, int32_t * __restrict__ ids_src1,
+        int32_t * __restrict__ ids_dst, int n_tokens, int neu, int nchannels_y,
+        int si1, int sis1) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_tokens * neu) return;
+    const int it  = i / neu;
+    const int iex = i % neu;
+    const int e   = ids[it * si1 + iex];
+    const int pos = bounds[e] + atomicAdd(&cursor[e], 1);
+    ids_src1[pos] = it * sis1 + iex % nchannels_y;
+    ids_dst [pos] = it * neu  + iex;
+}
+extern "C" void ggml_cuda_moe_build_routing(
+        const int32_t * ids, int32_t * ids_src1, int32_t * ids_dst,
+        int32_t * bounds, int32_t * scratch /* 2*E ints: counts+cursor */,
+        int E, int n_tokens, int neu, int nchannels_y, int si1, int sis1,
+        cudaStream_t stream) {
+    int32_t * counts = scratch;
+    int32_t * cursor = scratch + E;
+    cudaMemsetAsync(counts, 0, E * sizeof(int32_t), stream);
+    const int Mtot = n_tokens * neu;
+    const int nb = (Mtot + 255) / 256;
+    k_route_hist<<<nb, 256, 0, stream>>>(ids, counts, n_tokens, neu, si1);
+    int sb = 32; while (sb < E + 1) sb <<= 1;   // block >= E+1 threads, pow2
+    k_route_scan<<<1, sb, 0, stream>>>(counts, bounds, cursor, E);
+    k_route_scatter<<<nb, 256, 0, stream>>>(ids, bounds, cursor, ids_src1, ids_dst,
+                                            n_tokens, neu, nchannels_y, si1, sis1);
+}
+
+
 // Invert the compact->flat permutation: inv[ids_dst[m]] = m.
 // ids_dst is a bijection over [0, Mtot) (every token owns exactly neu slots).
 __global__ void k_moe_invert_ids(const int32_t * __restrict__ ids_dst, int32_t * __restrict__ inv, int Mtot) {

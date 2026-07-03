@@ -95,6 +95,12 @@ void ggml_cuda_moe_gather_f32_to_f16(
 void ggml_cuda_moe_scatter_f32(
     const float * src, const int32_t * ids_dst, float * dst,
     int Mtot, int N, int64_t s1, const float * fuse_w, int accum_neu, cudaStream_t stream);
+// parallel routing build: histogram->scan->scatter over Mtot threads.
+// scratch = 2*E int32 (counts + cursors). Requires E <= 1024.
+void ggml_cuda_moe_build_routing(
+    const int32_t * ids, int32_t * ids_src1, int32_t * ids_dst,
+    int32_t * bounds, int32_t * scratch, int E, int n_tokens, int neu,
+    int nchannels_y, int si1, int sis1, cudaStream_t stream);
 // ---- no-atomic expert-sum (2026-07-02): inverse-permutation gather ----
 // inv[ids_dst[m]] = m (ids_dst must be a bijection over [0, Mtot))
 void ggml_cuda_moe_invert_ids(const int32_t * ids_dst, int32_t * inv, int Mtot, cudaStream_t stream);
