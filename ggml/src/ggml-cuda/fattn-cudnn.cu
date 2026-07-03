@@ -67,6 +67,8 @@ static __global__ void k_fcfa_o_f16_to_f32(const half * __restrict__ src, float 
 // E4M3, descale = amax/448 restores magnitude inside cuDNN. Softmax probs P in
 // [0,1] use a fixed scale_s=448. O is emitted in HALF (scale_o=1) so there is
 // no output-side FP8 precision loss and the existing o_f16->f32 stage is reused.
+#include <cooperative_groups.h>
+
 #define FCFA_E4M3_MAX 448.0f
 
 // atomicMax on the int bit-pattern is monotonic for non-negative floats.
@@ -74,20 +76,38 @@ static __device__ __forceinline__ void fcfa_atomic_max_pos(float * addr, float v
     atomicMax((int *) addr, __float_as_int(v));
 }
 
-// amax over strided F32 [d,n,h] view (Q).
-static __global__ void k_fcfa_amax_f32(
-        const char * __restrict__ src, float * __restrict__ amax,
+// Fused single-pass staging: amax over a strided [d,n,h] view, then quantize the
+// SAME view to contiguous E4M3 [s][h][d] — one cooperative-groups launch per
+// tensor (grid.sync() between the amax and quantize passes). Writes the cuDNN
+// descale scalar inline. Replaces memset+3*amax+make_scales+3*quantize
+// (8 launches) with 3 launches. Exact per-tensor amax (no stale/delayed scale).
+//   src_is_f32=1: src is char* base with BYTE strides nb1/nb2 (Q, from F32)
+//   src_is_f32=0: src is half* base (already band-offset), ELEMENT strides (K/V)
+//   extras: 0=K (descale only); 1=Q (also ds[3]=1/448, ds[4]=448);
+//           2=V (also ds[5]=448/amax_v -> scale_o, O reuses V range)
+static __global__ void k_fcfa_stage_fused(
+        const char * __restrict__ src, __nv_fp8_e4m3 * __restrict__ dst,
         const int64_t d, const int64_t n, const int64_t h,
-        const int64_t nb1, const int64_t nb2) {
-    const int64_t total = d*n*h;
+        const int64_t nb1, const int64_t nb2, const int src_is_f32,
+        float * __restrict__ amax_scratch, float * __restrict__ descale_out,
+        const int extras, float * __restrict__ dsb) {
+    namespace cg = cooperative_groups;
+    cg::grid_group grid = cg::this_grid();
+    const int64_t total  = d*n*h;
+    const int64_t stride = (int64_t) gridDim.x*blockDim.x;
+    const int64_t gtid   = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+
+    if (gtid == 0) *amax_scratch = 0.0f;
+    grid.sync();
+
+    // pass 1: amax over the strided view
     float m = 0.0f;
-    for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < total;
-         i += (int64_t) gridDim.x*blockDim.x) {
-        const int64_t x = i % d;
-        const int64_t hh = (i / d) % h;
-        const int64_t s = i / (d*h);
-        const float * p = (const float *) (src + s*nb1 + hh*nb2);
-        m = fmaxf(m, fabsf(p[x]));
+    for (int64_t i = gtid; i < total; i += stride) {
+        const int64_t x = i % d, hh = (i / d) % h, s = i / (d*h);
+        const float val = src_is_f32
+            ? ((const float *) (src + s*nb1 + hh*nb2))[x]
+            : __half2float(((const half *) src)[s*nb1 + hh*nb2 + x]);
+        m = fmaxf(m, fabsf(val));
     }
     __shared__ float sm[256];
     sm[threadIdx.x] = m; __syncthreads();
@@ -95,45 +115,47 @@ static __global__ void k_fcfa_amax_f32(
         if (threadIdx.x < (unsigned) o) sm[threadIdx.x] = fmaxf(sm[threadIdx.x], sm[threadIdx.x+o]);
         __syncthreads();
     }
-    if (threadIdx.x == 0) fcfa_atomic_max_pos(amax, sm[0]);
+    if (threadIdx.x == 0) fcfa_atomic_max_pos(amax_scratch, sm[0]);
+    grid.sync();
+
+    // pass 2: quantize the same view with the global amax
+    const float amax   = fmaxf(*amax_scratch, 1e-6f);
+    const float qscale = FCFA_E4M3_MAX / amax;
+    for (int64_t i = gtid; i < total; i += stride) {
+        const int64_t x = i % d, hh = (i / d) % h, s = i / (d*h);
+        const float val = src_is_f32
+            ? ((const float *) (src + s*nb1 + hh*nb2))[x]
+            : __half2float(((const half *) src)[s*nb1 + hh*nb2 + x]);
+        dst[i] = __nv_fp8_e4m3(val * qscale); // dst is contiguous [s][h][x] == i
+    }
+    if (gtid == 0) {
+        *descale_out = amax / FCFA_E4M3_MAX;
+        if (extras == 1) { dsb[3] = 1.0f / FCFA_E4M3_MAX; dsb[4] = FCFA_E4M3_MAX; }
+        if (extras == 2) { dsb[5] = FCFA_E4M3_MAX / amax; }
+    }
 }
 
-// amax over strided F16 [d,n,h] view (K/V), base already offset by band_lo.
-static __global__ void k_fcfa_amax_f16(
-        const half * __restrict__ base, float * __restrict__ amax,
-        const int64_t d, const int64_t n, const int64_t h,
-        const int64_t nb1, const int64_t nb2) { // element strides
-    const int64_t total = d*n*h;
-    float m = 0.0f;
-    for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < total;
-         i += (int64_t) gridDim.x*blockDim.x) {
-        const int64_t x = i % d;
-        const int64_t hh = (i / d) % h;
-        const int64_t s = i / (d*h);
-        m = fmaxf(m, fabsf(__half2float(base[s*nb1 + hh*nb2 + x])));
+// Cooperative launch helper: sizes the grid to the max co-resident blocks so
+// grid.sync() is legal, then grid-strides over the whole view.
+static void fcfa_launch_stage(
+        const void * src, __nv_fp8_e4m3 * dst,
+        int64_t d, int64_t n, int64_t h, int64_t nb1, int64_t nb2, int src_is_f32,
+        float * amax_scratch, float * descale_out, int extras, float * dsb,
+        cudaStream_t stream) {
+    static int grid_blocks = 0;
+    if (grid_blocks == 0) {
+        int dev = 0; cudaGetDevice(&dev);
+        int nsm = 0; cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev);
+        int per_sm = 1;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, (const void *) k_fcfa_stage_fused, 256, 0);
+        grid_blocks = nsm * (per_sm > 0 ? per_sm : 1);
     }
-    __shared__ float sm[256];
-    sm[threadIdx.x] = m; __syncthreads();
-    for (int o = blockDim.x/2; o > 0; o >>= 1) {
-        if (threadIdx.x < (unsigned) o) sm[threadIdx.x] = fmaxf(sm[threadIdx.x], sm[threadIdx.x+o]);
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) fcfa_atomic_max_pos(amax, sm[0]);
-}
-
-// Turn the three amaxes into cuDNN descale/scale scalars + the quantize scales.
-// layout: ds[0..2]=descale q,k,v  ds[3]=descale_s ds[4]=scale_s ds[5]=scale_o
-//         qs[0..2]=quant scale q,k,v (448/amax)
-static __global__ void k_fcfa_make_scales(const float * __restrict__ amax,
-        float * __restrict__ ds, float * __restrict__ qs) {
-    const float aq = fmaxf(amax[0], 1e-6f);
-    const float ak = fmaxf(amax[1], 1e-6f);
-    const float av = fmaxf(amax[2], 1e-6f);
-    ds[0] = aq / FCFA_E4M3_MAX; ds[1] = ak / FCFA_E4M3_MAX; ds[2] = av / FCFA_E4M3_MAX;
-    ds[3] = 1.0f / FCFA_E4M3_MAX;   // descale_s (P in [0,1] stored *448)
-    ds[4] = FCFA_E4M3_MAX;          // scale_s
-    ds[5] = FCFA_E4M3_MAX / av;     // scale_o: |O| <= amax_v, so reuse V range (O is E4M3)
-    qs[0] = FCFA_E4M3_MAX / aq; qs[1] = FCFA_E4M3_MAX / ak; qs[2] = FCFA_E4M3_MAX / av;
+    const char * csrc = (const char *) src;
+    void * args[] = { (void *) &csrc, (void *) &dst, (void *) &d, (void *) &n, (void *) &h,
+                      (void *) &nb1, (void *) &nb2, (void *) &src_is_f32,
+                      (void *) &amax_scratch, (void *) &descale_out, (void *) &extras, (void *) &dsb };
+    cudaLaunchCooperativeKernel((const void *) k_fcfa_stage_fused,
+        dim3((unsigned) grid_blocks), dim3(256), args, 0, stream);
 }
 
 // Dequantize E4M3 O [s][h][dv] -> f32 dst. descale = 1/scale_o = amax_v/448 = ds[2].
@@ -145,34 +167,7 @@ static __global__ void k_fcfa_o_fp8_to_f32(const __nv_fp8_e4m3 * __restrict__ sr
     }
 }
 
-// Quantize strided F32 [d,n_q,h_q] view -> contiguous E4M3 [s][h][d].
-static __global__ void k_fcfa_q_f32_to_fp8(
-        const char * __restrict__ src, __nv_fp8_e4m3 * __restrict__ dst,
-        const int64_t d, const int64_t n_q, const int64_t h_q,
-        const int64_t nb1, const int64_t nb2, const float * __restrict__ qscale) {
-    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
-    if (i >= d*n_q*h_q) return;
-    const int64_t x = i % d;
-    const int64_t h = (i / d) % h_q;
-    const int64_t s = i / (d*h_q);
-    const float * p = (const float *) (src + s*nb1 + h*nb2);
-    dst[i] = __nv_fp8_e4m3(p[x] * qscale[0]);
-}
 
-// Quantize strided F16 [d,n_kv,h_k] view (base offset) -> contiguous E4M3 [s][h][d].
-static __global__ void k_fcfa_kv_f16_to_fp8(
-        const half * __restrict__ base, __nv_fp8_e4m3 * __restrict__ dst,
-        const int64_t d, const int64_t n_kv, const int64_t h_k,
-        const int64_t nb1, const int64_t nb2, const float * __restrict__ qscale, const int qidx) {
-    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
-    if (i >= d*n_kv*h_k) return;
-    const int64_t x = i % d;
-    const int64_t h = (i / d) % h_k;
-    const int64_t s = i / (d*h_k);
-    dst[i] = __nv_fp8_e4m3(__half2float(base[s*nb1 + h*nb2 + x]) * qscale[qidx]);
-}
-
-// Mask probe: per q-row, find the lowest/highest allowed KV index and the
 // allowed count. "Allowed" = mask value 0; any finite non-zero value (ALiBi
 // etc.) poisons the count so the band check fails. One block per row.
 // A row is a *contiguous* run iff cnt == hi - lo + 1.
@@ -381,7 +376,6 @@ static bool fcfa_run_fp8(
     ggml_cuda_pool_alloc<__nv_fp8_e4m3> o_fp8(ctx.pool(), dv*n_q*h_q);
     ggml_cuda_pool_alloc<float>         amax (ctx.pool(), 3);
     ggml_cuda_pool_alloc<float>         dsb  (ctx.pool(), 6); // descale q,k,v,s + scale_s + scale_o
-    ggml_cuda_pool_alloc<float>         qsb  (ctx.pool(), 3); // quant scales q,k,v
     ggml_cuda_pool_alloc<float>         amo  (ctx.pool(), 2); // amax_s, amax_o sinks
     ggml_cuda_pool_alloc<char>          ws;
     if (ent.ws_size > 0) {
@@ -391,24 +385,14 @@ static bool fcfa_run_fp8(
     const half * base_k = (const half *) ((const char *) K->data + (int64_t) band_lo*K->nb[1]);
     const half * base_v = (const half *) ((const char *) V->data + (int64_t) band_lo*V->nb[1]);
 
-    CUDA_CHECK(cudaMemsetAsync(amax.get(), 0, 3*sizeof(float), stream));
-    // amax reductions (fixed grid; grid-stride covers the whole view)
-    k_fcfa_amax_f32<<<256, 256, 0, stream>>>((const char *) Q->data, amax.get() + 0,
-        d, n_q, h_q, (int64_t) Q->nb[1], (int64_t) Q->nb[2]);
-    k_fcfa_amax_f16<<<256, 256, 0, stream>>>(base_k, amax.get() + 1, d, dim_kv_fp8, h_k, k_nb1, k_nb2);
-    k_fcfa_amax_f16<<<256, 256, 0, stream>>>(base_v, amax.get() + 2, d, dim_kv_fp8, h_k, v_nb1, v_nb2);
-    k_fcfa_make_scales<<<1, 1, 0, stream>>>(amax.get(), dsb.get(), qsb.get());
-    // quantize to E4M3
-    {
-        const int blk = 256;
-        const int64_t nq = d*n_q*h_q, nk = d*dim_kv_fp8*h_k;
-        k_fcfa_q_f32_to_fp8<<<(unsigned) ((nq+blk-1)/blk), blk, 0, stream>>>(
-            (const char *) Q->data, q_fp8.get(), d, n_q, h_q, (int64_t) Q->nb[1], (int64_t) Q->nb[2], qsb.get());
-        k_fcfa_kv_f16_to_fp8<<<(unsigned) ((nk+blk-1)/blk), blk, 0, stream>>>(
-            base_k, k_fp8.get(), d, dim_kv_fp8, h_k, k_nb1, k_nb2, qsb.get(), 1);
-        k_fcfa_kv_f16_to_fp8<<<(unsigned) ((nk+blk-1)/blk), blk, 0, stream>>>(
-            base_v, v_fp8.get(), d, dim_kv_fp8, h_k, v_nb1, v_nb2, qsb.get(), 2);
-    }
+    // Fused single-pass staging: amax+quantize per tensor in ONE cooperative
+    // launch each (grid.sync between passes). 8 launches -> 3, descales inline.
+    fcfa_launch_stage(Q->data, q_fp8.get(), d, n_q, h_q,
+        (int64_t) Q->nb[1], (int64_t) Q->nb[2], /*f32*/1, amax.get()+0, dsb.get()+0, /*Q*/1, dsb.get(), stream);
+    fcfa_launch_stage(base_k, k_fp8.get(), d, dim_kv_fp8, h_k,
+        k_nb1, k_nb2, /*f16*/0, amax.get()+1, dsb.get()+1, /*K*/0, dsb.get(), stream);
+    fcfa_launch_stage(base_v, v_fp8.get(), d, dim_kv_fp8, h_k,
+        v_nb1, v_nb2, /*f16*/0, amax.get()+2, dsb.get()+2, /*V*/2, dsb.get(), stream);
 
     std::unordered_map<int64_t, void *> pack = {
         {UID_Q,      q_fp8.get()},
