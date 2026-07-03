@@ -433,6 +433,64 @@ __global__ void k_scatter_rowscaled(
     }
 }
 
+// Invert the compact->flat permutation: inv[ids_dst[m]] = m.
+// ids_dst is a bijection over [0, Mtot) (every token owns exactly neu slots).
+__global__ void k_moe_invert_ids(const int32_t * __restrict__ ids_dst, int32_t * __restrict__ inv, int Mtot) {
+    const int m = blockIdx.x * blockDim.x + threadIdx.x;
+    if (m < Mtot) {
+        inv[ids_dst[m]] = m;
+    }
+}
+
+extern "C" void ggml_cuda_moe_invert_ids(const int32_t * ids_dst, int32_t * inv, int Mtot, cudaStream_t stream) {
+    k_moe_invert_ids<<<(unsigned) ((Mtot + 255)/256), 256, 0, stream>>>(ids_dst, inv, Mtot);
+}
+
+// GATHER replacement for the accum scatter: one block per TOKEN. Reads the
+// token's neu compact rows via the inverse permutation, sums in registers,
+// writes each dst element exactly once (coalesced float4, no atomics, no
+// dst pre-zeroing). ~5x faster than the atomicAdd scatter at prefill sizes.
+// bf16 src variant (NVFP4 path): gain = row_scale[m] * fuse_w[flat].
+__global__ void k_gather_accum_rowscaled(
+        const uint16_t * __restrict__ src, const float * __restrict__ row_scale,
+        const int32_t * __restrict__ inv, float * __restrict__ dst,
+        int n_tokens, int N, int64_t s1, const float * __restrict__ fuse_w, int neu) {
+    const int t = blockIdx.x;
+    if (t >= n_tokens) return;
+    __shared__ int   s_m[16];
+    __shared__ float s_g[16];
+    if (threadIdx.x < (unsigned) neu) {
+        const int flat = t * neu + (int) threadIdx.x;
+        const int m    = inv[flat];
+        s_m[threadIdx.x] = m;
+        float g = row_scale[m];
+        if (fuse_w) g *= fuse_w[flat];
+        s_g[threadIdx.x] = g;
+    }
+    __syncthreads();
+    float * drow = dst + (int64_t) t * s1;
+    const bool aligned = ((uintptr_t) drow & 15) == 0;
+    for (int n4 = threadIdx.x; n4 < N / 4; n4 += blockDim.x) {
+        float4 acc = {0.f, 0.f, 0.f, 0.f};
+        #pragma unroll 4
+        for (int e = 0; e < neu; ++e) {
+            const ushort4 v = ((const ushort4 *) (src + (size_t) s_m[e] * N))[n4];
+            const float g = s_g[e];
+            uint32_t b; float f;
+            b = (uint32_t) v.x << 16; memcpy(&f, &b, 4); acc.x += f * g;
+            b = (uint32_t) v.y << 16; memcpy(&f, &b, 4); acc.y += f * g;
+            b = (uint32_t) v.z << 16; memcpy(&f, &b, 4); acc.z += f * g;
+            b = (uint32_t) v.w << 16; memcpy(&f, &b, 4); acc.w += f * g;
+        }
+        if (aligned) {
+            ((float4 *) drow)[n4] = acc;
+        } else {
+            drow[n4*4+0] = acc.x; drow[n4*4+1] = acc.y;
+            drow[n4*4+2] = acc.z; drow[n4*4+3] = acc.w;
+        }
+    }
+}
+
 extern "C" void ggml_cuda_nvfp4_scatter_rowscaled(
         const void * d_bf16, const float * row_scale, const int32_t * ids_dst,
         float * dst, int Mtot, int N, int64_t s1, const float * fuse_w, int accum_neu,
@@ -445,6 +503,14 @@ extern "C" void ggml_cuda_nvfp4_scatter_rowscaled(
         k_scatter_rowscaled<false><<<(unsigned) Mtot, threads, 0, stream>>>(
             (const uint16_t *) d_bf16, row_scale, ids_dst, dst, Mtot, N, s1, fuse_w, accum_neu);
     }
+}
+
+extern "C" void ggml_cuda_nvfp4_gather_accum_rowscaled(
+        const void * d_bf16, const float * row_scale, const int32_t * inv,
+        float * dst, int n_tokens, int N, int64_t s1, const float * fuse_w, int neu,
+        cudaStream_t stream) {
+    k_gather_accum_rowscaled<<<(unsigned) n_tokens, 256, 0, stream>>>(
+        (const uint16_t *) d_bf16, row_scale, inv, dst, n_tokens, N, s1, fuse_w, neu);
 }
 // ============================================================================
 // F16 MoE prefill glue (2026-07-02): gather f32->f16, scatter f32->f32
@@ -520,4 +586,49 @@ extern "C" void ggml_cuda_moe_scatter_f32(
     } else {
         k_scatter_f32<false><<<(unsigned) Mtot, 256, 0, stream>>>(src, ids_dst, dst, Mtot, N, s1, fuse_w, accum_neu);
     }
+}
+
+// f32-src gather-accum variant (F16 MoE path). Same inverse-permutation
+// no-atomic design as k_gather_accum_rowscaled.
+__global__ void k_gather_accum_f32(
+        const float * __restrict__ src, const int32_t * __restrict__ inv,
+        float * __restrict__ dst, int n_tokens, int N, int64_t s1,
+        const float * __restrict__ fuse_w, int neu) {
+    const int t = blockIdx.x;
+    if (t >= n_tokens) return;
+    __shared__ int   s_m[16];
+    __shared__ float s_g[16];
+    if (threadIdx.x < (unsigned) neu) {
+        const int flat = t * neu + (int) threadIdx.x;
+        s_m[threadIdx.x] = inv[flat];
+        s_g[threadIdx.x] = fuse_w ? fuse_w[flat] : 1.0f;
+    }
+    __syncthreads();
+    float * drow = dst + (int64_t) t * s1;
+    if ((((uintptr_t) src | (uintptr_t) drow) & 15) == 0 && (N & 3) == 0) {
+        for (int n4 = threadIdx.x; n4 < N / 4; n4 += blockDim.x) {
+            float4 acc = {0.f, 0.f, 0.f, 0.f};
+            #pragma unroll 4
+            for (int e = 0; e < neu; ++e) {
+                const float4 v = ((const float4 *) (src + (size_t) s_m[e] * N))[n4];
+                const float g = s_g[e];
+                acc.x += v.x * g; acc.y += v.y * g; acc.z += v.z * g; acc.w += v.w * g;
+            }
+            ((float4 *) drow)[n4] = acc;
+        }
+    } else {
+        for (int n = threadIdx.x; n < N; n += blockDim.x) {
+            float acc = 0.f;
+            for (int e = 0; e < neu; ++e) {
+                acc += src[(size_t) s_m[e] * N + n] * s_g[e];
+            }
+            drow[n] = acc;
+        }
+    }
+}
+
+extern "C" void ggml_cuda_moe_gather_accum_f32(
+        const float * src, const int32_t * inv, float * dst,
+        int n_tokens, int N, int64_t s1, const float * fuse_w, int neu, cudaStream_t stream) {
+    k_gather_accum_f32<<<(unsigned) n_tokens, 256, 0, stream>>>(src, inv, dst, n_tokens, N, s1, fuse_w, neu);
 }

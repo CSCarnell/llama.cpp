@@ -95,6 +95,20 @@ void ggml_cuda_moe_gather_f32_to_f16(
 void ggml_cuda_moe_scatter_f32(
     const float * src, const int32_t * ids_dst, float * dst,
     int Mtot, int N, int64_t s1, const float * fuse_w, int accum_neu, cudaStream_t stream);
+// ---- no-atomic expert-sum (2026-07-02): inverse-permutation gather ----
+// inv[ids_dst[m]] = m (ids_dst must be a bijection over [0, Mtot))
+void ggml_cuda_moe_invert_ids(const int32_t * ids_dst, int32_t * inv, int Mtot, cudaStream_t stream);
+// One block/token: sums the token's neu compact rows in registers, writes dst
+// once (no atomics, no pre-zero). Replaces scatter_rowscaled<accum=true>.
+// neu must be <= 16.
+void ggml_cuda_nvfp4_gather_accum_rowscaled(
+    const void * d_bf16, const float * row_scale, const int32_t * inv,
+    float * dst, int n_tokens, int N, int64_t s1, const float * fuse_w, int neu,
+    cudaStream_t stream);
+// f32-src variant (F16 MoE path)
+void ggml_cuda_moe_gather_accum_f32(
+    const float * src, const int32_t * inv, float * dst,
+    int n_tokens, int N, int64_t s1, const float * fuse_w, int neu, cudaStream_t stream);
 
 #ifdef __cplusplus
 }

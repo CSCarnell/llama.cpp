@@ -351,6 +351,7 @@ struct PrefillScratch {
     uint8_t  * dSFA = nullptr; size_t sfa_cap = 0;   // sf_rows*(K/QSUB)
     float    * dG   = nullptr; size_t g_cap   = 0;   // Mtot
     ElementD * dD   = nullptr; size_t d_cap   = 0;   // Mtot*N
+    int32_t  * dInv = nullptr; size_t inv_cap = 0;   // Mtot (inverse permutation)
     void     * ws   = nullptr; size_t ws_cap  = 0;   // GEMM workspace
 };
 static std::mutex g_pf_mtx;
@@ -462,10 +463,19 @@ extern "C" int ggml_cuda_cutlass_moe_nvfp4_prefill(
     if (gemm.initialize(args, g_pf.ws, stream) != cutlass::Status::kSuccess) return 3;
     if (gemm.run(stream) != cutlass::Status::kSuccess) return 4;
 
-    // ---- fused scatter + rescale + bf16->f32 straight into unsorted dst ----
-    if (accum_neu > 0) {
-        cudaMemsetAsync(dst, 0, (size_t) (Mtot / accum_neu) * s1 * sizeof(float), stream);
+    // ---- fused expert-sum + rescale + bf16->f32 straight into unsorted dst ----
+    if (accum_neu > 0 && accum_neu <= 16) {
+        // no-atomic path: invert permutation once, then per-token register-accum
+        // gather (each dst element written exactly once; no memset, no atomics)
+        grow((void **) &g_pf.dInv, &g_pf.inv_cap, (size_t) Mtot * sizeof(int32_t));
+        ggml_cuda_moe_invert_ids(ids_dst, g_pf.dInv, Mtot, stream);
+        ggml_cuda_nvfp4_gather_accum_rowscaled(g_pf.dD, g_pf.dG, g_pf.dInv, dst,
+                                               Mtot / accum_neu, N, s1, fuse_w, accum_neu, stream);
+    } else {
+        if (accum_neu > 0) {
+            cudaMemsetAsync(dst, 0, (size_t) (Mtot / accum_neu) * s1 * sizeof(float), stream);
+        }
+        ggml_cuda_nvfp4_scatter_rowscaled(g_pf.dD, g_pf.dG, ids_dst, dst, Mtot, N, s1, fuse_w, accum_neu, stream);
     }
-    ggml_cuda_nvfp4_scatter_rowscaled(g_pf.dD, g_pf.dG, ids_dst, dst, Mtot, N, s1, fuse_w, accum_neu, stream);
     return 0;
 }

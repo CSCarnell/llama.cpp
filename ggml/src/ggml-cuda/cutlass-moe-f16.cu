@@ -67,6 +67,7 @@ struct F16Scratch {
     int64_t * ldc = nullptr; int64_t * ldd = nullptr;
     void * dA = nullptr; size_t a_cap = 0;   // Mtot*K f16
     void * dD = nullptr; size_t d_cap = 0;   // Mtot*N f32
+    void * dInv = nullptr; size_t inv_cap = 0; // Mtot i32 (inverse permutation)
     void * ws = nullptr; size_t ws_cap = 0;
 };
 static std::mutex g_f16_mtx;
@@ -161,10 +162,18 @@ extern "C" int ggml_cuda_cutlass_moe_f16_prefill(
     if (gemm.initialize(args, g_f16.ws, stream) != cutlass::Status::kSuccess) return 3;
     if (gemm.run(stream) != cutlass::Status::kSuccess) return 4;
 
-    // ---- scatter f32 rows into unsorted dst ----
-    if (accum_neu > 0) {
-        cudaMemsetAsync(dst, 0, (size_t) (Mtot / accum_neu) * s1 * sizeof(float), stream);
+    // ---- expert-sum f32 rows into unsorted dst ----
+    if (accum_neu > 0 && accum_neu <= 16) {
+        // no-atomic path: invert permutation, per-token register-accum gather
+        f16_grow(&g_f16.dInv, &g_f16.inv_cap, (size_t) Mtot * sizeof(int32_t));
+        ggml_cuda_moe_invert_ids(ids_dst, (int32_t *) g_f16.dInv, Mtot, stream);
+        ggml_cuda_moe_gather_accum_f32((const float *) g_f16.dD, (const int32_t *) g_f16.dInv,
+                                       dst, Mtot / accum_neu, N, s1, fuse_w, accum_neu, stream);
+    } else {
+        if (accum_neu > 0) {
+            cudaMemsetAsync(dst, 0, (size_t) (Mtot / accum_neu) * s1 * sizeof(float), stream);
+        }
+        ggml_cuda_moe_scatter_f32((const float *) g_f16.dD, ids_dst, dst, Mtot, N, s1, fuse_w, accum_neu, stream);
     }
-    ggml_cuda_moe_scatter_f32((const float *) g_f16.dD, ids_dst, dst, Mtot, N, s1, fuse_w, accum_neu, stream);
     return 0;
 }
