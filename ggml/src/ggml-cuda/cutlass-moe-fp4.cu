@@ -16,6 +16,8 @@
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
+#include "cutlass/epilogue/fusion/operations.hpp"
+#include "cutlass/epilogue/fusion/sm90_callbacks_tma_warpspecialized.hpp"
 #include "cutlass/util/packed_stride.hpp"
 #include "cutlass/detail/sm100_blockscaled_layout.hpp"
 #include "cute/tensor.hpp"
@@ -128,6 +130,45 @@ using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1x
 using ElementSF = typename Gemm::GemmKernel::CollectiveMainloop::ElementSF;
 using ElementAData = typename ElementA::DataType;
 using ElementBData = typename ElementB::DataType;
+
+// ===================== dense-proj FUSED epilogue (float D + per-row scale EVT) =====================
+// The dense Q/K/V/O projection GEMM (E=1 group) normally writes bf16 to a scratch
+// buffer, then a standalone k_bf16_to_f32_rowscaled kernel reads it back, multiplies
+// by the per-row activation global scale dG[m], and writes f32 dst (2.9% of prefill,
+// a full extra M*N HBM round-trip). This EVT folds that into the GEMM epilogue:
+//     D_f32[m,n] = acc[m,n] * dG[m]
+// ColBroadcast runs in PtrArray mode (ElementInput_ = float*) so the single-group
+// dG pointer is supplied via a 1-element device pointer array. Sm90 visitor nodes are
+// the SM100/SM120 epilogue's native EVT vocabulary (reused by the sm120 builder).
+namespace fusion_ns = cutlass::epilogue::fusion;
+using DenseScaleBcast = fusion_ns::Sm90ColBroadcast<
+    0, ThreadBlockShape, float* /*per-group ptr array -> PtrArray mode*/, float,
+    cute::Stride<cute::_1, cute::_0, cute::_0>>;
+using DenseMul = fusion_ns::Sm90Compute<
+    cutlass::multiplies, float /*ElementOutput = ElementD*/, float /*ElementCompute*/,
+    cutlass::FloatRoundStyle::round_to_nearest>;
+using DenseFusion = fusion_ns::Sm90EVT<DenseMul, DenseScaleBcast, fusion_ns::Sm90AccFetch>;
+
+using CollectiveEpilogueDense = typename cutlass::epilogue::collective::CollectiveBuilder<
+    ArchTag, OperatorClass, ThreadBlockShape, ClusterShape,
+    cutlass::epilogue::collective::EpilogueTileAuto,
+    ElementAccumulator, ElementAccumulator,
+    float, LayoutCTag *, 4 /*AlignmentC (f32)*/,
+    float, LayoutCTag *, 4 /*AlignmentD (f32)*/,
+    cutlass::epilogue::collective::EpilogueScheduleAuto,
+    DenseFusion>::CollectiveOp;
+
+using CollectiveMainloopDense = typename cutlass::gemm::collective::CollectiveBuilder<
+    ArchTag, OperatorClass,
+    ElementA, LayoutATag *, AlignmentA,
+    ElementB, LayoutBTag *, AlignmentB,
+    ElementAccumulator, ThreadBlockShape, ClusterShape,
+    cutlass::gemm::collective::StageCountAutoCarveout<
+        static_cast<int>(sizeof(typename CollectiveEpilogueDense::SharedStorage))>,
+    MoEKernelSchedule>::CollectiveOp;
+
+using GemmKernelDense = cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloopDense, CollectiveEpilogueDense>;
+using GemmDense = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelDense>;
 
 #define QSUB QSUB_VAL
 
@@ -562,6 +603,43 @@ extern "C" int ggml_cuda_cutlass_dense_nvfp4(
         h.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
         return h;
     }();
+    // ---- FUSED EVT path: D_f32[m,n] = acc[m,n] * dG[m], written straight to dst.
+    // Folds the standalone k_bf16_to_f32_rowscaled dequant (2.9% of prefill, a full
+    // M*N HBM round-trip) into the GEMM epilogue. Escape hatch reverts to two-step. ----
+    static const bool evt_off = getenv("GGML_CUDA_DENSE_EVT_OFF") != nullptr;
+    if (!evt_off) {
+        // 1-element (E=1) device pointer arrays for the dst output and per-row scale.
+        static float **      dPD    = nullptr; // ptr_D array  -> dst
+        static const float ** dScale = nullptr; // ColBroadcast ptr_col array -> dG
+        if (!dPD    && cudaMalloc(&dPD,    sizeof(float *)) != cudaSuccess) { cudaGetLastError(); dPD = nullptr; }
+        if (!dScale && cudaMalloc(&dScale, sizeof(float *)) != cudaSuccess) { cudaGetLastError(); dScale = nullptr; }
+        if (dPD && dScale) {
+            float *       hPD[1]    = { dst };
+            const float * hScale[1] = { g_pf.dG };
+            cudaMemcpyAsync(dPD,    hPD,    sizeof(float *), cudaMemcpyHostToDevice, stream);
+            cudaMemcpyAsync(dScale, hScale, sizeof(float *), cudaMemcpyHostToDevice, stream);
+            typename GemmDense::Arguments args;
+            args.mode = cutlass::gemm::GemmUniversalMode::kGrouped;
+            args.problem_shape = {1, g_pf.ps, nullptr};
+            args.mainloop = { g_pf.pA, g_pf.sa, g_pf.pB, g_pf.sb, g_pf.pSFA, g_pf.la, g_pf.pSFB, g_pf.lb };
+            // EVT tree Sm90EVT<Mul, ColBroadcast, AccFetch> -> Args {ColBroadcast, AccFetch, Mul}
+            args.epilogue.thread = { { dScale, 0.0f, {} }, {}, {} };
+            args.epilogue.ptr_C = (const float **) g_pf.pC; // unused (no source load), nullptr entries
+            args.epilogue.dC    = (typename GemmKernelDense::CollectiveEpilogue::StrideC) g_pf.sc;
+            args.epilogue.ptr_D = dPD;
+            args.epilogue.dD    = (typename GemmKernelDense::CollectiveEpilogue::StrideD) g_pf.sd;
+            args.hw_info = hw;
+            GemmDense gemm;
+            const size_t wssz = GemmDense::get_workspace_size(args);
+            grow(&g_pf.ws, &g_pf.ws_cap, wssz ? wssz : 1);
+            if (gemm.can_implement(args) == cutlass::Status::kSuccess &&
+                gemm.initialize(args, g_pf.ws, stream) == cutlass::Status::kSuccess &&
+                gemm.run(stream) == cutlass::Status::kSuccess) {
+                return 0;
+            }
+            // EVT can_implement/run failed -> fall through to proven two-step path below.
+        }
+    }
     typename Gemm::Arguments args;
     args.mode = cutlass::gemm::GemmUniversalMode::kGrouped;
     args.problem_shape = {1, g_pf.ps, nullptr};
