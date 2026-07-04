@@ -2651,10 +2651,94 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+#ifdef GGML_CUDA_CUTLASS_FP4
+// One-time requantization of a Q8_0 dense weight (attention Q/K/V/O projections) into
+// GGML_TYPE_NVFP4 blocks so it can ride the block-scaled FP4 tensor-core dense GEMM
+// (~2x int8 MMQ rate on Blackwell) instead of the int8 MMQ pipeline. We reuse the
+// CANONICAL host quantizer (ggml_quantize_chunk + Q8_0 to_float) that produced the GGUF,
+// so the block layout is guaranteed identical to what get_repacked_weights() consumes.
+// Result is cached by the source weight pointer; the host round-trip happens exactly once
+// per weight tensor and is fully amortized over the run. Accuracy is 4-bit (lossy vs Q8_0);
+// gated behind GGML_CUDA_DENSE_PROJ_NVFP4 and validated by the correctness gate.
+static const void * ggml_cuda_dense_proj_nvfp4_weight(const ggml_tensor * w) {
+    static std::mutex mtx;
+    static std::unordered_map<const void *, void *> cache;
+    std::lock_guard<std::mutex> lk(mtx);
+    auto it = cache.find(w->data);
+    if (it != cache.end()) return it->second;
+
+    const int64_t K = w->ne[0];   // input dim  (row length)
+    const int64_t N = w->ne[1];   // output dim (rows)
+    const size_t q8_row = ggml_row_size(GGML_TYPE_Q8_0,   K);
+    const size_t nv_row = ggml_row_size(GGML_TYPE_NVFP4,  K);
+
+    // pull Q8_0 weight device -> host (one-time; blocking copy is fine here)
+    std::vector<char> hq8((size_t) N * q8_row);
+    if (cudaMemcpy(hq8.data(), w->data, hq8.size(), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        cudaGetLastError(); cache[w->data] = nullptr; return nullptr;
+    }
+    // dequantize Q8_0 -> F32 via the canonical type-trait
+    const ggml_type_traits * tt = ggml_get_type_traits(GGML_TYPE_Q8_0);
+    std::vector<float> hf((size_t) N * K);
+    for (int64_t r = 0; r < N; ++r) {
+        tt->to_float((const char *) hq8.data() + r * q8_row, hf.data() + r * K, K);
+    }
+    // quantize F32 -> NVFP4 with the exact GGUF quantizer (layout-compatible)
+    std::vector<char> hnv((size_t) N * nv_row);
+    ggml_quantize_chunk(GGML_TYPE_NVFP4, hf.data(), hnv.data(), 0, N, K, /*imatrix=*/nullptr);
+
+    void * dnv = nullptr;
+    if (cudaMalloc(&dnv, hnv.size()) != cudaSuccess) {
+        cudaGetLastError(); cache[w->data] = nullptr; return nullptr; // OOM -> fall back to MMQ
+    }
+    if (cudaMemcpy(dnv, hnv.data(), hnv.size(), cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaGetLastError(); cudaFree(dnv); cache[w->data] = nullptr; return nullptr;
+    }
+    cache[w->data] = dnv;
+    return dnv;
+}
+#endif // GGML_CUDA_CUTLASS_FP4
+
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
 #ifdef GGML_CUDA_CUTLASS_FP4
+    // Dense Q8_0 attention-projection -> NVFP4 requant path. Routes the int8 MMQ
+    // projections (Q/K/V/O, ~21% of prefill) onto the FP4 tensor-core dense GEMM.
+    // Opt-in via GGML_CUDA_DENSE_PROJ_NVFP4; correctness-gated; MMQ remains the fallback.
+    {
+        // Default ON (validated: "Paris" + needle pass, NVFP4 +12.3% prefill). dense_nvfp4
+        // self-gates on the MoE prefill scratch (g_pf), so it safely no-ops -> MMQ fallback
+        // when the CUTLASS MoE path is not active. Escape hatch: GGML_CUDA_DENSE_PROJ_NVFP4_OFF.
+        static const bool proj_nvfp4 = getenv("GGML_CUDA_DENSE_PROJ_NVFP4_OFF") == nullptr;
+        static const int proj_min_m = [] {
+            const char * s = getenv("GGML_CUDA_DENSE_PROJ_MIN");
+            return s ? atoi(s) : 64;
+        }();
+        if (proj_nvfp4 && !split && src0->type == GGML_TYPE_Q8_0 &&
+            src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+            src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+            src1->ne[1] >= proj_min_m && ggml_is_contiguous(dst) &&
+            ggml_cuda_cutlass_moe_nvfp4_supported(1, (int) src0->ne[1], (int) src0->ne[0])) {
+            const void * wnv = ggml_cuda_dense_proj_nvfp4_weight(src0);
+            if (wnv) {
+                const int64_t s11  = src1->nb[1] / ggml_type_size(src1->type);
+                const int64_t s1   = dst->nb[1]  / ggml_type_size(dst->type);
+                const size_t  nb01 = ggml_row_size(GGML_TYPE_NVFP4, src0->ne[0]);
+                const int rc = ggml_cuda_cutlass_dense_nvfp4(
+                    wnv, (const float *) src1->data, (float *) dst->data,
+                    (int) src0->ne[1], (int) src0->ne[0], (int) src1->ne[1],
+                    s11, s1, nb01, 0, ctx.stream());
+                if (rc == 0) {
+                    CUDA_CHECK(cudaGetLastError());
+                    return;
+                }
+            }
+        }
+    }
+
+
     // Dense NVFP4 large-batch path: block-scaled FP4 tensor cores (CUTLASS)
     // instead of MMQ's int8 pipeline. Opt-in via GGML_CUDA_CUTLASS_MOE_PREFILL
     // (same flag as the MoE path — it is the same engine). Weights repacked
@@ -2665,17 +2749,26 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             const char * s = getenv("GGML_CUDA_CUTLASS_DENSE_MIN");
             return s ? atoi(s) : 64;
         }();
-        if (cutlass_dense && !split && src0->type == GGML_TYPE_NVFP4 &&
+        const bool dense_is_nvfp4 = src0->type == GGML_TYPE_NVFP4 &&
+            ggml_cuda_cutlass_moe_nvfp4_supported(1, (int) src0->ne[1], (int) src0->ne[0]);
+        const bool dense_is_mxfp4 = src0->type == GGML_TYPE_MXFP4 &&
+            ggml_cuda_cutlass_moe_mxfp4_supported(1, (int) src0->ne[1], (int) src0->ne[0]);
+        if (cutlass_dense && !split && (dense_is_nvfp4 || dense_is_mxfp4) &&
             src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
             src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
-            src1->ne[1] >= dense_min_m && ggml_is_contiguous(dst) &&
-            ggml_cuda_cutlass_moe_nvfp4_supported(1, (int) src0->ne[1], (int) src0->ne[0])) {
+            src1->ne[1] >= dense_min_m && ggml_is_contiguous(dst)) {
             const int64_t s11 = src1->nb[1] / ggml_type_size(src1->type);
             const int64_t s1  = dst->nb[1]  / ggml_type_size(dst->type);
-            if (ggml_cuda_cutlass_dense_nvfp4(
+            const int rc = dense_is_nvfp4 ?
+                ggml_cuda_cutlass_dense_nvfp4(
                     src0->data, (const float *) src1->data, (float *) dst->data,
                     (int) src0->ne[1], (int) src0->ne[0], (int) src1->ne[1],
-                    s11, s1, src0->nb[1], src0->nb[2], ctx.stream()) == 0) {
+                    s11, s1, src0->nb[1], src0->nb[2], ctx.stream()) :
+                ggml_cuda_cutlass_dense_mxfp4(
+                    src0->data, (const float *) src1->data, (float *) dst->data,
+                    (int) src0->ne[1], (int) src0->ne[0], (int) src1->ne[1],
+                    s11, s1, src0->nb[1], src0->nb[2], ctx.stream());
+            if (rc == 0) {
                 CUDA_CHECK(cudaGetLastError());
                 return;
             }
@@ -2852,10 +2945,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             return s ? atoi(s) : 64;
         }();
         if (cutlass_prefill_enabled &&
-            (src0->type == GGML_TYPE_NVFP4 || src0->type == GGML_TYPE_F16) &&
+            (src0->type == GGML_TYPE_NVFP4 || src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_F16) &&
             ne2 >= cutlass_prefill_min_tokens && ne13 == 1 &&
             (src0->type == GGML_TYPE_F16 ||
-             ggml_cuda_cutlass_moe_nvfp4_supported((int) ne02, (int) ne01, (int) ne00))) {
+             (src0->type == GGML_TYPE_NVFP4 &&
+              ggml_cuda_cutlass_moe_nvfp4_supported((int) ne02, (int) ne01, (int) ne00)) ||
+             (src0->type == GGML_TYPE_MXFP4 &&
+              ggml_cuda_cutlass_moe_mxfp4_supported((int) ne02, (int) ne01, (int) ne00)))) {
 
             cudaStream_t stream = ctx.stream();
             const int64_t n_expert_used = ids->ne[0];
@@ -2871,17 +2967,26 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
             const int64_t s11 = nb11 / ggml_type_size(src1->type);
             const int64_t s1  = nb1  / ggml_type_size(dst->type);
-            const int rc = src0->type == GGML_TYPE_NVFP4 ?
-                ggml_cuda_cutlass_moe_nvfp4_prefill(
-                    src0->data, (const float *) src1->data, &ids_args,
-                    (float *) dst->data,
-                    (int) ne02, (int) ne01, (int) ne00, (int) ne_get_rows,
-                    s11, s1, nb01, nb02, /*fuse_w=*/nullptr, /*accum_neu=*/0, stream) :
-                ggml_cuda_cutlass_moe_f16_prefill(
+            int rc;
+            if (src0->type == GGML_TYPE_NVFP4) {
+                rc = ggml_cuda_cutlass_moe_nvfp4_prefill(
                     src0->data, (const float *) src1->data, &ids_args,
                     (float *) dst->data,
                     (int) ne02, (int) ne01, (int) ne00, (int) ne_get_rows,
                     s11, s1, nb01, nb02, /*fuse_w=*/nullptr, /*accum_neu=*/0, stream);
+            } else if (src0->type == GGML_TYPE_MXFP4) {
+                rc = ggml_cuda_cutlass_moe_mxfp4_prefill(
+                    src0->data, (const float *) src1->data, &ids_args,
+                    (float *) dst->data,
+                    (int) ne02, (int) ne01, (int) ne00, (int) ne_get_rows,
+                    s11, s1, nb01, nb02, /*fuse_w=*/nullptr, /*accum_neu=*/0, stream);
+            } else {
+                rc = ggml_cuda_cutlass_moe_f16_prefill(
+                    src0->data, (const float *) src1->data, &ids_args,
+                    (float *) dst->data,
+                    (int) ne02, (int) ne01, (int) ne00, (int) ne_get_rows,
+                    s11, s1, nb01, nb02, /*fuse_w=*/nullptr, /*accum_neu=*/0, stream);
+            }
             CUDA_CHECK(cudaGetLastError());
             if (rc == 0) {
                 if (fcmoe_debug) {
@@ -3576,6 +3681,20 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                     const bool mmid_use_mmf  = ggml_cuda_should_use_mmf(mmid_src0->type, cc, WARP_SIZE,
                         mmid_src0->ne, mmid_src0->nb, mmid_src1->ne[2], /*mul_mat_id=*/true);
                     safe_to_keep = (mmid_use_mmvq || mmid_use_mmq || mmid_use_mmf);
+                }
+                // FC_PREFILL_GRAPHS: the FP4 MoE mul_mat_id nodes are handled by the
+                // graph-safe CUTLASS FFN fusion (device-side histogram/scan/scatter
+                // routing, H2D-async operand staging, no D2H copies, no per-call
+                // stream sync — repack sync is one-time & cached). Whitelist them so
+                // the prefill forward pass can be captured into a CUDA graph.
+                static const bool fc_prefill_graphs = [] {
+                    const char * e = getenv("FC_PREFILL_GRAPHS");
+                    return e && atoi(e) == 1;
+                }();
+                if (fc_prefill_graphs &&
+                    (node->src[0]->type == GGML_TYPE_NVFP4 ||
+                     node->src[0]->type == GGML_TYPE_MXFP4)) {
+                    safe_to_keep = true;
                 }
                 if (!safe_to_keep) {
                     use_cuda_graph = false;
@@ -4343,6 +4462,45 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     }
                 }
             }
+            // ---- optional trailing residual ADD fusion ----
+            // The FFN block is followed by cur = ggml_add(moe_out, ffn_inp). Fold
+            // that add into the gather_accum epilogue: dst = residual + sum_experts.
+            // Kills the standalone bin_bcast ADD kernel AND one full HBM
+            // write+read round-trip of the hidden state (perf/watt win under the
+            // 600W power cap). Only for the expert-sum path (out != null).
+            ggml_tensor * res_dst = nullptr;
+            const float * residual_ptr = nullptr;
+            int64_t residual_s1 = 0;
+            int res_extra = 0;
+            if (out) {
+                const int i_out = i + 4 + neu + (neu - 1);
+                if (i_out + 1 < cgraph->n_nodes) {
+                    ggml_tensor * addn = cgraph->nodes[i_out + 1];
+                    ggml_tensor * resid = nullptr;
+                    if (addn->op == GGML_OP_ADD) {
+                        if      (addn->src[0] == out) resid = addn->src[1];
+                        else if (addn->src[1] == out) resid = addn->src[0];
+                    }
+                    if (resid && resid->type == GGML_TYPE_F32 && addn->type == GGML_TYPE_F32 &&
+                        ggml_is_contiguous(resid) && ggml_is_contiguous(addn) &&
+                        resid->ne[0] == out->ne[0] && resid->ne[1] == out->ne[1] &&
+                        resid->ne[2] == out->ne[2] && resid->ne[3] == out->ne[3] &&
+                        addn->ne[0] == out->ne[0] && addn->ne[1] == out->ne[1]) {
+                        std::vector<ggml_op> ops2 = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU,
+                                                      GGML_OP_MUL_MAT_ID, GGML_OP_MUL };
+                        for (int v = 0; v < neu; ++v)     ops2.push_back(GGML_OP_VIEW);
+                        for (int a = 0; a < neu - 1; ++a) ops2.push_back(GGML_OP_ADD);
+                        ops2.push_back(GGML_OP_ADD); // trailing residual add
+                        const int i_out2 = i_out + 1;
+                        if (ggml_can_fuse_subgraph(cgraph, i, (int) ops2.size(), ops2.data(), &i_out2, 1)) {
+                            res_dst      = addn;
+                            residual_ptr = (const float *) resid->data;
+                            residual_s1  = resid->nb[1] / sizeof(float);
+                            res_extra    = 1;
+                        }
+                    }
+                }
+            }
             if (!out) {
                 const std::vector<ggml_op> ops = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU,
                                                    GGML_OP_MUL_MAT_ID, GGML_OP_MUL };
@@ -4360,7 +4518,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     (int) (ids->nb[1] / ggml_element_size(ids)),
                     (int) (src1->nb[2] / src1->nb[1]),
                 };
-                ggml_tensor * dst_t = out ? out : mul;
+                ggml_tensor * dst_t = res_dst ? res_dst : (out ? out : mul);
                 const int accum_neu = out ? neu : 0;
                 const int64_t s11 = src1->nb[1]  / ggml_type_size(src1->type);
                 const int64_t s1  = dst_t->nb[1] / ggml_type_size(dst_t->type);
@@ -4373,19 +4531,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     gate_n->src[0]->nb[1], gate_n->src[0]->nb[2],
                     up_n->src[0]->nb[1],   up_n->src[0]->nb[2],
                     down->src[0]->nb[1],   down->src[0]->nb[2],
-                    (const float *) w->data, accum_neu, stream);
+                    (const float *) w->data, accum_neu,
+                    residual_ptr, residual_s1, stream);
                 CUDA_CHECK(cudaGetLastError());
                 if (rc == 0) {
                     if (getenv("FCMOE_DEBUG")) {
                         static bool once = false;
                         if (!once) {
                             once = true;
-                            fprintf(stderr, "[FCMOE] WHOLE-FFN fusion ACTIVE (gate+up+swiglu+down%s)\n",
-                                    out ? "+expert-sum" : "");
+                            fprintf(stderr, "[FCMOE] WHOLE-FFN fusion ACTIVE (gate+up+swiglu+down%s%s)\n",
+                                    out ? "+expert-sum" : "", res_dst ? "+residual" : "");
                             fflush(stderr);
                         }
                     }
-                    return 4 + extra;
+                    return 4 + extra + res_extra;
                 }
             }
         }
