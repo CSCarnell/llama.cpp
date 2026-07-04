@@ -8,6 +8,7 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <climits>
 #include <cmath>
@@ -540,7 +541,12 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
-    // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
+    return common_sampler_sample_no_sync(gsmpl, ctx, idx, grammar_first);
+}
+
+llama_token common_sampler_sample_no_sync(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
+    // NOTE: caller is responsible for calling llama_synchronize(ctx) once beforehand.
+    // start measuring sampling time (context already synchronized by the caller)
     const auto tm = gsmpl->tm();
 
     llama_token id = LLAMA_TOKEN_NULL;
@@ -549,6 +555,67 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & rbudget = gsmpl->rbudget;
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
+
+    // [FC greedy fast-path] For greedy (argmax-equivalent) sampling with an optional
+    // grammar, the full chain result is simply the global-argmax token among the
+    // grammar-valid set. In that regime we can skip building+scanning the whole
+    // n_vocab candidate array (set_logits materializes ~152k llama_token_data per
+    // slot, 96x/step = the dominant CPU sampling cost) and instead do a single
+    // argmax pass over the raw logits, then a cheap single-token grammar check.
+    // If the argmax token is grammar-rejected (rare for a format-following model),
+    // we fall through to the exact full path below. Env FC_GREEDY_FASTPATH=0 disables.
+    {
+        static const bool fastpath_enabled = [](){ const char * e = getenv("FC_GREEDY_FASTPATH"); return !e || e[0] != '0'; }();
+        const common_params_sampling & P = gsmpl->params;
+        const bool greedy_argmax_ok =
+            fastpath_enabled &&
+            P.temp <= 0.0f &&
+            P.mirostat == 0 &&
+            P.penalty_repeat  == 1.0f &&
+            P.penalty_freq    == 0.0f &&
+            P.penalty_present == 0.0f &&
+            P.dry_multiplier  == 0.0f &&
+            P.xtc_probability == 0.0f &&
+            P.typ_p >= 1.0f &&
+            !P.has_logit_bias() &&
+            rbudget == nullptr &&
+            !grammar_first &&
+            llama_get_sampled_token_ith(ctx, idx) == LLAMA_TOKEN_NULL; // no backend sampler
+        if (greedy_argmax_ok) {
+            const float * logits = llama_get_logits_ith(ctx, idx);
+            if (logits) {
+                const llama_model * model = llama_get_model(ctx);
+                const llama_vocab * vocab = llama_model_get_vocab(model);
+                const int n_vocab = llama_vocab_n_tokens(vocab);
+                int   best  = 0;
+                float bestv = logits[0];
+                for (int t = 1; t < n_vocab; ++t) {
+                    if (logits[t] > bestv) { bestv = logits[t]; best = t; }
+                }
+                bool accepted = true;
+                if (grammar_should_apply(gsmpl)) {
+                    llama_token_data       one = { best, bestv, 0.0f };
+                    llama_token_data_array oa  = { &one, 1, -1, false };
+                    llama_sampler_apply(grmr, &oa);
+                    accepted = one.logit != -INFINITY;
+                }
+                if (accepted) {
+                    // populate a minimal cur_p so downstream consumers stay valid
+                    gsmpl->cur.resize(1);
+                    gsmpl->cur[0] = llama_token_data{ best, bestv, 1.0f };
+                    cur_p = { gsmpl->cur.data(), 1, 0, false };
+                    static const bool dbg = getenv("FC_GREEDY_DBG") != nullptr;
+                    if (dbg) {
+                        static std::atomic<uint64_t> hit{0};
+                        uint64_t h = hit.fetch_add(1, std::memory_order_relaxed) + 1;
+                        if (h % 20000 == 0) { fprintf(stderr, "[FC_GREEDY] fastpath hits=%llu\n", (unsigned long long) h); fflush(stderr); }
+                    }
+                    return best;
+                }
+                // argmax grammar-rejected -> fall through to exact full path
+            }
+        }
+    }
 
     gsmpl->set_logits(ctx, idx);
 
