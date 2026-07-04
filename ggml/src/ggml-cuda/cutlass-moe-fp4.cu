@@ -535,6 +535,46 @@ static void * grow(void ** p, size_t * cap, size_t need) {
     return *p;
 }
 
+
+// Ensure the per-group CUTLASS argument arrays (ps/pA/pB/pC/pD/pSFA/pSFB/
+// strides/layouts/sf_off) are allocated for at least E groups. Shared by the
+// NVFP4 MoE prefill path and the dense (E=1) projection path. Extracting this
+// lets the dense path build its own E=1 scratch in models whose MoE path is NOT
+// NVFP4 (e.g. MXFP4): there the NVFP4 MoE path never runs, so g_pf.E_cap would
+// otherwise stay 0 and every Q8_0 dense projection would fall back to int8 MMQ.
+// Grow-only (realloc only when E grows). Caller must hold g_pf_mtx.
+static bool pf_ensure_group_args(int E) {
+    if (E <= g_pf.E_cap) return true;
+    if (g_pf.args_blob) cudaFree(g_pf.args_blob);
+    const size_t per_e =
+        sizeof(typename ProblemShape::UnderlyingProblemShape) +
+        2 * sizeof(void *) + 2 * sizeof(void *) + 2 * sizeof(void *) +
+        sizeof(StrideA) + sizeof(StrideB) + sizeof(StrideC) + sizeof(StrideD) +
+        sizeof(LayoutSFA) + sizeof(LayoutSFB) + sizeof(int32_t);
+    const int Ecap = E;
+    if (cudaMalloc(&g_pf.args_blob, (per_e + 64) * (size_t) Ecap) != cudaSuccess) { // slack for 16B alignment carving
+        cudaGetLastError(); g_pf.args_blob = nullptr; g_pf.E_cap = 0; return false; // OOM -> caller falls back to MMQ
+    }
+    uint8_t * base = (uint8_t *) g_pf.args_blob;
+    auto carve = [&](size_t bytes) { void * r = base; base += (bytes + 15) & ~size_t(15); return r; };
+    g_pf.ps   = (typename ProblemShape::UnderlyingProblemShape *) carve(sizeof(*g_pf.ps) * Ecap);
+    g_pf.pA   = (const ElementAData **) carve(sizeof(void *) * Ecap);
+    g_pf.pB   = (const ElementBData **) carve(sizeof(void *) * Ecap);
+    g_pf.pC   = (const ElementC **)     carve(sizeof(void *) * Ecap);
+    g_pf.pD   = (ElementD **)           carve(sizeof(void *) * Ecap);
+    g_pf.pSFA = (const ElementSF **)    carve(sizeof(void *) * Ecap);
+    g_pf.pSFB = (const ElementSF **)    carve(sizeof(void *) * Ecap);
+    g_pf.sa   = (StrideA *)   carve(sizeof(StrideA) * Ecap);
+    g_pf.sb   = (StrideB *)   carve(sizeof(StrideB) * Ecap);
+    g_pf.sc   = (StrideC *)   carve(sizeof(StrideC) * Ecap);
+    g_pf.sd   = (StrideD *)   carve(sizeof(StrideD) * Ecap);
+    g_pf.la   = (LayoutSFA *) carve(sizeof(LayoutSFA) * Ecap);
+    g_pf.lb   = (LayoutSFB *) carve(sizeof(LayoutSFB) * Ecap);
+    g_pf.sf_off = (int32_t *) carve(sizeof(int32_t) * Ecap);
+    g_pf.E_cap = E;
+    return true;
+}
+
 // A-operand reuse cache (file scope so the dense path can invalidate it):
 // gate and up projections of one layer consume the SAME activations with the
 // SAME routing -> identical quantized A/SFA/G. Skip the quant pass on reuse.
@@ -571,7 +611,7 @@ extern "C" int ggml_cuda_cutlass_dense_nvfp4(
     // scratch shared with the MoE prefill path (same stream => ordered, safe),
     // but the A-reuse cache must be invalidated since dAq is overwritten here.
     s_a_src1 = nullptr;
-    if (1 > g_pf.E_cap) return 1;          // E-cap scratch built lazily by MoE path; E>=1 always true after first MoE call
+    if (!pf_ensure_group_args(1)) return 1; // build E=1 group-arg scratch (self-sufficient: works in MXFP4 models where the NVFP4 MoE path never runs)
     const size_t sf_rows = (size_t) M + 128;
     grow((void **) &g_pf.dAq,  &g_pf.aq_cap,  (size_t) M * (K / 2));
     grow((void **) &g_pf.dSFA, &g_pf.sfa_cap, sf_rows * (K / QSUB));
@@ -675,35 +715,7 @@ extern "C" int ggml_cuda_cutlass_moe_nvfp4_prefill(
     if (!wc.dB) return 1; // repack OOM -> caller falls back to MMQ
 
     // ---- scratch (grow-only; steady-state = zero allocations) ----
-    if (E > g_pf.E_cap) {
-        if (g_pf.args_blob) cudaFree(g_pf.args_blob);
-        const size_t per_e =
-            sizeof(typename ProblemShape::UnderlyingProblemShape) +
-            2 * sizeof(void *) + 2 * sizeof(void *) + 2 * sizeof(void *) +
-            sizeof(StrideA) + sizeof(StrideB) + sizeof(StrideC) + sizeof(StrideD) +
-            sizeof(LayoutSFA) + sizeof(LayoutSFB) + sizeof(int32_t);
-        const int Ecap = E;
-        if (cudaMalloc(&g_pf.args_blob, (per_e + 64) * (size_t) Ecap) != cudaSuccess) { // slack for 16B alignment carving
-            cudaGetLastError(); g_pf.args_blob = nullptr; return 1; // OOM -> fall back
-        }
-        uint8_t * base = (uint8_t *) g_pf.args_blob;
-        auto carve = [&](size_t bytes) { void * r = base; base += (bytes + 15) & ~size_t(15); return r; };
-        g_pf.ps   = (typename ProblemShape::UnderlyingProblemShape *) carve(sizeof(*g_pf.ps) * Ecap);
-        g_pf.pA   = (const ElementAData **) carve(sizeof(void *) * Ecap);
-        g_pf.pB   = (const ElementBData **) carve(sizeof(void *) * Ecap);
-        g_pf.pC   = (const ElementC **)     carve(sizeof(void *) * Ecap);
-        g_pf.pD   = (ElementD **)           carve(sizeof(void *) * Ecap);
-        g_pf.pSFA = (const ElementSF **)    carve(sizeof(void *) * Ecap);
-        g_pf.pSFB = (const ElementSF **)    carve(sizeof(void *) * Ecap);
-        g_pf.sa   = (StrideA *)   carve(sizeof(StrideA) * Ecap);
-        g_pf.sb   = (StrideB *)   carve(sizeof(StrideB) * Ecap);
-        g_pf.sc   = (StrideC *)   carve(sizeof(StrideC) * Ecap);
-        g_pf.sd   = (StrideD *)   carve(sizeof(StrideD) * Ecap);
-        g_pf.la   = (LayoutSFA *) carve(sizeof(LayoutSFA) * Ecap);
-        g_pf.lb   = (LayoutSFB *) carve(sizeof(LayoutSFB) * Ecap);
-        g_pf.sf_off = (int32_t *) carve(sizeof(int32_t) * Ecap);
-        g_pf.E_cap = E;
-    }
+    if (!pf_ensure_group_args(E)) return 1; // grow-only per-group arg scratch (OOM -> fall back to MMQ)
     const size_t sf_rows = (size_t) Mtot + 128 * (size_t) E;    // worst-case round-up padding
     grow((void **) &g_pf.dAq,  &g_pf.aq_cap,  (size_t) Mtot * (K / 2));
     grow((void **) &g_pf.dSFA, &g_pf.sfa_cap, sf_rows * (K / QSUB));
