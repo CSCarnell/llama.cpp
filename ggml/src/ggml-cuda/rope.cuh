@@ -7,3 +7,7 @@ void ggml_cuda_op_rope(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 void ggml_cuda_op_rope_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_rope_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * set_rows);
+
+// Fused RMS_NORM + MUL(weight) + ROPE(neox) for q_norm/k_norm (eliminates Q/K HBM round-trips).
+void ggml_cuda_op_rms_norm_mul_rope(ggml_backend_cuda_context & ctx,
+                                    ggml_tensor * rms, ggml_tensor * mul, ggml_tensor * rope);

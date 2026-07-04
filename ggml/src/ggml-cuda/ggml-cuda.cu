@@ -1634,6 +1634,13 @@ static const cublas_force_compute_type & ggml_cuda_cublas_get_force_compute_type
 
 static std::atomic<uint64_t> g_fc_rms_fuse_count{0};
 static std::atomic<uint64_t> g_fc_rms_add_fuse_count{0};
+static std::atomic<uint64_t> g_fc_rms_rope_fuse_count{0};
+
+// Fused RMS_NORM + MUL(weight) + ROPE(neox) for q_norm/k_norm. Default ON.
+static bool ggml_cuda_fuse_qk_rope_off() {
+    static const bool off = getenv("FC_FUSE_QK_ROPE_OFF") != nullptr;
+    return off;
+}
 
 static std::atomic<uint64_t> g_fc_ffn_fuse_count{0};
 static std::atomic<uint64_t> g_fc_bias_fuse_count{0};
@@ -4991,6 +4998,30 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    // Fused RMS_NORM + MUL(weight) + ROPE(neox) -- q_norm/k_norm + rope. Eliminates
+    // two HBM round-trips of Q and K. MUST precede the {RMS_NORM, MUL} check below.
+    // Guard: pure neox (full rope, n_dims == head_dim), f32 in/out, no freq_factors.
+    if (!ggml_cuda_fuse_qk_rope_off() &&
+        ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE }, {})) {
+        ggml_tensor * rope_node = cgraph->nodes[i + 2];
+        const int32_t * rp = (const int32_t *) rope_node->op_params;
+        const int  n_dims = rp[1];
+        const int  mode   = rp[2];
+        const bool ok = (mode == GGML_ROPE_TYPE_NEOX)
+                     && node->src[0]->type == GGML_TYPE_F32
+                     && rope_node->type == GGML_TYPE_F32
+                     && rope_node->src[2] == nullptr          // no freq_factors
+                     && n_dims == node->src[0]->ne[0]         // full rope
+                     && (node->src[0]->ne[0] % 2 == 0);
+        if (ok) {
+            if (ggml_cuda_fc_trace_fusion_enabled()) {
+                g_fc_rms_rope_fuse_count.fetch_add(1, std::memory_order_relaxed);
+            }
+            ggml_cuda_op_rms_norm_mul_rope(*cuda_ctx, node, cgraph->nodes[i + 1], rope_node);
+            return 2;
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
         if (ggml_cuda_fc_trace_fusion_enabled()) {
             g_fc_rms_fuse_count.fetch_add(1, std::memory_order_relaxed);
@@ -5247,9 +5278,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     }
 
     if (ggml_cuda_fc_trace_fusion_enabled()) {
-        fprintf(stderr, "[FCFUSE] rms_norm_mul=%llu rms_norm_mul_add=%llu ffn_glu_mmv=%llu bias_mmv=%llu\n",
+        fprintf(stderr, "[FCFUSE] rms_norm_mul=%llu rms_norm_mul_add=%llu rms_norm_mul_rope=%llu ffn_glu_mmv=%llu bias_mmv=%llu\n",
                 (unsigned long long) g_fc_rms_fuse_count.load(std::memory_order_relaxed),
                 (unsigned long long) g_fc_rms_add_fuse_count.load(std::memory_order_relaxed),
+                (unsigned long long) g_fc_rms_rope_fuse_count.load(std::memory_order_relaxed),
                 (unsigned long long) g_fc_ffn_fuse_count.load(std::memory_order_relaxed),
                 (unsigned long long) g_fc_bias_fuse_count.load(std::memory_order_relaxed));
     }

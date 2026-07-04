@@ -659,6 +659,120 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
     }
 }
 
+// ============================================================================
+// Fused RMS_NORM + MUL(weight) + ROPE(neox)  -- Qwen3 q_norm / k_norm + rope.
+// Eliminates two HBM round-trips of Q and K (norm writes -> rope reads) by
+// keeping the normalized row in registers and rotating it in place.
+// Assumes: pure neox (full rope, n_dims == head_dim), f32 in/out, no
+// freq_factors. One block per (head, token) row; blockDim.x = head_dim/2.
+// Gated by the dispatch in ggml-cuda.cu; falls back to the unfused path when
+// the assumptions don't hold. (2026-07-03)
+// ============================================================================
+static __global__ void rms_norm_mul_rope_neox_f32(
+        const float * __restrict__ x,
+        const float * __restrict__ weight,
+        float *       __restrict__ dst,
+        const int      ncols,
+        const int      ne01,        // n_head
+        const int      ne02,        // n_tokens
+        const int      s01, const int s02, const int s03,   // x strides (elements)
+        const int      d1,  const int d2,  const int d3,    // dst strides (elements)
+        const int32_t * __restrict__ pos,
+        const float    freq_scale,
+        const float    ext_factor,
+        const float    attn_factor,
+        const rope_corr_dims corr_dims,
+        const float    theta_scale,
+        const float    eps) {
+    const int nh  = ncols / 2;                  // pairs == threads
+    const int row = blockIdx.x;                 // 0 .. ne01*ne02*ne03-1
+    const int i1  = row % ne01;                 // head
+    const int i2  = (row / ne01) % ne02;        // token
+    const int i3  = row / (ne01 * ne02);        // batch
+    const int tid = threadIdx.x;                // 0 .. nh-1
+
+    const float * xr = x   + (int64_t) i1*s01 + (int64_t) i2*s02 + (int64_t) i3*s03;
+    float *       dr = dst + (int64_t) i1*d1  + (int64_t) i2*d2  + (int64_t) i3*d3;
+
+    const float x0 = xr[tid];
+    const float x1 = xr[tid + nh];
+
+    // ---- RMS reduction over all ncols elements ----
+    float ss = x0*x0 + x1*x1;
+    ss = warp_reduce_sum(ss);                   // per-warp partial in lane 0
+    __shared__ float s_warp[32];
+    __shared__ float s_scale;
+    const int warp = tid / WARP_SIZE;
+    const int lane = tid % WARP_SIZE;
+    if (lane == 0) s_warp[warp] = ss;
+    __syncthreads();
+    if (tid == 0) {
+        const int nwarps = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
+        float tot = 0.0f;
+        for (int w = 0; w < nwarps; ++w) tot += s_warp[w];
+        s_scale = rsqrtf(tot / ncols + eps);
+    }
+    __syncthreads();
+    const float scale = s_scale;
+
+    // ---- normalize + per-column weight ----
+    const float n0 = x0 * scale * weight[tid];
+    const float n1 = x1 * scale * weight[tid + nh];
+
+    // ---- rope neox: pair (tid, tid+nh), i0 = 2*tid ----
+    const float theta = (float) pos[i2] * powf(theta_scale, (float) tid);
+    float cos_t, sin_t;
+    rope_yarn<true>(theta, freq_scale, corr_dims, 2*tid, ext_factor, attn_factor, cos_t, sin_t);
+    dr[tid]      = n0*cos_t - n1*sin_t;
+    dr[tid + nh] = n0*sin_t + n1*cos_t;
+}
+
+void ggml_cuda_op_rms_norm_mul_rope(ggml_backend_cuda_context & ctx,
+                                    ggml_tensor * rms, ggml_tensor * mul, ggml_tensor * rope) {
+    const ggml_tensor * x_t   = rms->src[0];
+    const ggml_tensor * w_t   = (mul->src[0] == rms) ? mul->src[1] : mul->src[0];
+    const ggml_tensor * pos_t = rope->src[1];
+    cudaStream_t stream = ctx.stream();
+
+    const int ncols = x_t->ne[0];
+    const int ne01  = x_t->ne[1];
+    const int ne02  = x_t->ne[2];
+    const int ne03  = x_t->ne[3];
+
+    const int s01 = x_t->nb[1] / sizeof(float);
+    const int s02 = x_t->nb[2] / sizeof(float);
+    const int s03 = x_t->nb[3] / sizeof(float);
+    const int d1  = rope->nb[1] / sizeof(float);
+    const int d2  = rope->nb[2] / sizeof(float);
+    const int d3  = rope->nb[3] / sizeof(float);
+
+    float eps;
+    memcpy(&eps, rms->op_params, sizeof(float));
+
+    const int   n_dims     = ((const int32_t *) rope->op_params)[1];
+    const int   n_ctx_orig = ((const int32_t *) rope->op_params)[4];
+    float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+    memcpy(&freq_base,   (const int32_t *) rope->op_params +  5, sizeof(float));
+    memcpy(&freq_scale,  (const int32_t *) rope->op_params +  6, sizeof(float));
+    memcpy(&ext_factor,  (const int32_t *) rope->op_params +  7, sizeof(float));
+    memcpy(&attn_factor, (const int32_t *) rope->op_params +  8, sizeof(float));
+    memcpy(&beta_fast,   (const int32_t *) rope->op_params +  9, sizeof(float));
+    memcpy(&beta_slow,   (const int32_t *) rope->op_params + 10, sizeof(float));
+
+    const float theta_scale = powf(freq_base, -2.0f / n_dims);
+    rope_corr_dims corr_dims;
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims.v);
+
+    const int nrows = ne01 * ne02 * ne03;
+    const int nh    = ncols / 2;
+    rms_norm_mul_rope_neox_f32<<<dim3(nrows), dim3(nh), 0, stream>>>(
+        (const float *) x_t->data, (const float *) w_t->data, (float *) rope->data,
+        ncols, ne01, ne02, s01, s02, s03, d1, d2, d3,
+        (const int32_t *) pos_t->data, freq_scale, ext_factor, attn_factor,
+        corr_dims, theta_scale, eps);
+}
+
+
 void ggml_cuda_op_rope(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_rope_impl<true>(ctx, dst);
 }
