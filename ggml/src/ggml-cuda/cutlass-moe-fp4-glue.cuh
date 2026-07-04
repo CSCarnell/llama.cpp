@@ -94,6 +94,28 @@ void ggml_cuda_bf16_to_f32_rowscaled(const void * src_bf16, float * dst,
                                      const float * row_scale, int M, int N,
                                      cudaStream_t stream);
 
+// ---- MXFP4 prefill glue (single-level E8M0, block-32) ----
+// Mirror of the NVFP4 kernels for ggml block_mxfp4 { uint8_t e; uint8_t qs[16] }.
+// Nibbles are bit-compatible with cutlass::float_e2m1_t; the E8M0 byte is a direct
+// cutlass::float_ue8m0_t (bias 127). SF layout uses SFVecSize=32 (numKTiles=(K+127)/128).
+// No per-row global scale: each 32-block owns one E8M0, so row_scale is written 1.0
+// and the shared scatter/rescale/swiglu epilogue path is reused verbatim (alpha=1.0).
+void ggml_cuda_mxfp4_repack_weights(
+    const void * src0_blocks, void * b_e2m1, void * sfb,
+    int E, int N, int K, size_t nb01, size_t nb02, cudaStream_t stream);
+
+void ggml_cuda_mxfp4_gather_quant(
+    const float * src1, const int32_t * ids_src1, const int32_t * expert_bounds,
+    const int32_t * sf_offsets, float * row_scale, void * a_e2m1, void * sfa,
+    int E, int Mtot, int K, int64_t s11, cudaStream_t stream);
+
+void ggml_cuda_mxfp4_swiglu_quant(
+    const void * d_gate_bf16, const void * d_up_bf16, const float * row_scale1,
+    const int32_t * expert_bounds, const int32_t * sf_offsets,
+    float * row_scale2, void * a_e2m1, void * sfa,
+    int E, int Mtot, int K, cudaStream_t stream);
+
+
 // ---- F16 MoE prefill glue (2026-07-02) ----
 // gather + f32->f16 convert through ids_src1 (one block/row, vectorized)
 void ggml_cuda_moe_gather_f32_to_f16(
@@ -119,7 +141,7 @@ void ggml_cuda_moe_invert_ids(const int32_t * ids_dst, int32_t * inv, int Mtot, 
 void ggml_cuda_nvfp4_gather_accum_rowscaled(
     const void * d_bf16, const float * row_scale, const int32_t * inv,
     float * dst, int n_tokens, int N, int64_t s1, const float * fuse_w, int neu,
-    cudaStream_t stream);
+    const float * residual, int64_t rs1, cudaStream_t stream);
 // f32-src variant (F16 MoE path)
 void ggml_cuda_moe_gather_accum_f32(
     const float * src, const int32_t * inv, float * dst,

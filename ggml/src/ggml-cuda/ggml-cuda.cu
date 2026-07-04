@@ -4406,9 +4406,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const ggml_tensor * w   = mul->src[1];
         bool ok = ffn_enabled && gate_n &&
             down->src[1] == glu && mul->src[0] == down &&
-            gate_n->src[0]->type == GGML_TYPE_NVFP4 &&
-            up_n->src[0]->type   == GGML_TYPE_NVFP4 &&
-            down->src[0]->type   == GGML_TYPE_NVFP4 &&
+            // Both block-scaled FP4 formats route through the same fused chain
+            // (cutlass-moe-fp4.cu compiled twice: NVFP4 + MXFP4 via FC_FP4_MX).
+            // Require all three FFN weights to share ONE fp4 format.
+            (gate_n->src[0]->type == GGML_TYPE_NVFP4 || gate_n->src[0]->type == GGML_TYPE_MXFP4) &&
+            up_n->src[0]->type   == gate_n->src[0]->type &&
+            down->src[0]->type   == gate_n->src[0]->type &&
             gate_n->src[1] == up_n->src[1] && up_n->src[2] == ids && down->src[2] == ids &&
             gate_n->src[1]->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 &&
             w->type == GGML_TYPE_F32 &&
@@ -4522,7 +4525,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 const int accum_neu = out ? neu : 0;
                 const int64_t s11 = src1->nb[1]  / ggml_type_size(src1->type);
                 const int64_t s1  = dst_t->nb[1] / ggml_type_size(dst_t->type);
-                const int rc = ggml_cuda_cutlass_moe_nvfp4_ffn(
+                // Same ABI for both fp4 formats; select the compiled variant.
+                const bool is_mxfp4 = gate_n->src[0]->type == GGML_TYPE_MXFP4;
+                const auto moe_ffn  = is_mxfp4 ? ggml_cuda_cutlass_moe_mxfp4_ffn
+                                               : ggml_cuda_cutlass_moe_nvfp4_ffn;
+                const int rc = moe_ffn(
                     gate_n->src[0]->data, up_n->src[0]->data, down->src[0]->data,
                     (const float *) src1->data, &ids_args, (float *) dst_t->data,
                     (int) gate_n->src[0]->ne[2], (int) gate_n->src[0]->ne[1],
@@ -4539,7 +4546,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                         static bool once = false;
                         if (!once) {
                             once = true;
-                            fprintf(stderr, "[FCMOE] WHOLE-FFN fusion ACTIVE (gate+up+swiglu+down%s%s)\n",
+                            fprintf(stderr, "[FCMOE] WHOLE-FFN fusion ACTIVE [%s] (gate+up+swiglu+down%s%s)\n",
+                                    is_mxfp4 ? "MXFP4" : "NVFP4",
                                     out ? "+expert-sum" : "", res_dst ? "+residual" : "");
                             fflush(stderr);
                         }

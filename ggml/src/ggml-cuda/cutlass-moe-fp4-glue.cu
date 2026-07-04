@@ -17,6 +17,16 @@
 #define NVFP4_NSUB    (QK_NVFP4 / QK_NVFP4_SUB)   // 4
 #define NVFP4_BYTES   36                          // 4 scale (d[4]) + 32 qs = 36 (matches ggml block_nvfp4)
 
+// MXFP4: single-level, one E8M0 scale per 32-element block. block_mxfp4 =
+// { uint8_t e; uint8_t qs[16] } (17 bytes). Effective dequant is
+// e2m1_std[nibble] * 2^(e-127) — nibbles bit-compatible with cutlass::float_e2m1_t,
+// e byte a direct cutlass::float_ue8m0_t (bias 127). The CUTLASS mx SF layout uses
+// SFVecSize=32, so 4 scale-groups pack per 128-element K-tile (numKTiles=(K+127)/128);
+// the [mTiles,kTiles,32,4,4] swizzle atom (d_sf_swizzle) is block-size independent.
+#define QK_MXFP4      32
+#define QK_MXFP4_SUB  32                          // one E8M0 scale per 32-elem block
+#define MXFP4_BYTES   17                          // 1 e (E8M0) + 16 qs = 17 (matches ggml block_mxfp4)
+
 // ----------------------------------------------------------------------------
 // device helpers
 // ----------------------------------------------------------------------------
@@ -51,6 +61,25 @@ __device__ __forceinline__ float d_ue4m3_to_fp32_std(uint8_t x) {
     int man = x & 0x7;
     if (exp == 0) return ldexpf((float)man, -9);
     return ldexpf(1.0f + (float)man / 8.0f, exp - 7);
+}
+
+// f32 amax -> E8M0 biased exponent (bias 127) selecting the SMALLEST power of two
+// >= amax/6, so the largest e2m1 code (6.0) * 2^(e-127) covers amax with no clipping.
+// Matches cutlass::float_ue8m0_t decode 2^(e-127). Zero/neg -> 0 (all-zero block).
+__device__ __forceinline__ uint8_t d_fp32_to_e8m0(float amax) {
+    const float x = amax * (1.0f / 6.0f);
+    if (!(x > 0.0f)) return 0;
+    int e;
+    const float m = frexpf(x, &e);            // x = m * 2^e, m in [0.5,1)
+    int biased = ((m == 0.5f) ? (e - 1) : e) + 127;   // ceil(log2(x)) + 127
+    if (biased < 0)   biased = 0;
+    if (biased > 254) biased = 254;           // 255 = NaN in e8m0
+    return (uint8_t) biased;
+}
+
+// standard ue8m0 -> f32: 2^(e-127) (matches cutlass::float_ue8m0_t).
+__device__ __forceinline__ float d_e8m0_to_fp32(uint8_t e) {
+    return exp2f((int) e - 127);
 }
 
 // nearest standard-e2m1 4-bit code for value x given block scale.
@@ -500,6 +529,229 @@ extern "C" void ggml_cuda_nvfp4_gather_quant(
         (uint8_t *) a_e2m1, (uint8_t *) sfa, E, Mtot, K, s11, numKTiles);
 }
 
+// ============================================================================
+// MXFP4 variants (single-level E8M0, block-32). Mirror the NVFP4 kernels but:
+//   * one E8M0 scale per 32-element block (no per-row global scale g[m])
+//   * ggml block_mxfp4 = { uint8_t e; uint8_t qs[16] } (17 bytes)
+//   * SF layout numKTiles = (K+127)/128 (4 scale-groups x 32 = 128 per K-tile)
+//   * row_scale is written as 1.0f so the downstream scatter/rescale path is reused
+//     verbatim (alpha=1.0, no epilogue rescale).
+// ============================================================================
+
+// weight repack: one thread per (weight row, 32-element block)
+__global__ void k_mxfp4_repack_weights(
+        const uint8_t * src0, uint8_t * b_e2m1, uint8_t * sfb,
+        int E, int N, int K, size_t nb01, size_t nb02, int numKTiles) {
+    const int nsubK = K / QK_MXFP4;               // 32-blocks (=scales) per row
+    const long total = (long)E * N * nsubK;
+    long tid = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= total) return;
+
+    const int g  = (int)(tid % nsubK);            // block along K
+    const long rn = tid / nsubK;                  // global weight row (e*N + n)
+    const int n  = (int)(rn % N);
+    const int e  = (int)(rn / N);
+
+    const uint8_t * blkptr =
+        src0 + (size_t)e * nb02 + (size_t)n * nb01 + (size_t)g * MXFP4_BYTES;
+    const uint8_t em0 = blkptr[0];                // E8M0 scale byte
+    const uint8_t * qs = blkptr + 1;              // 16 qs bytes
+
+    // scale: copy ggml e8m0 byte straight through, into swizzled SFB position
+    uint8_t * sfb_e = sfb + (size_t)e * N * (K / QK_MXFP4);
+    sfb_e[d_sf_swizzle(n, g, numKTiles)] = em0;
+
+    // e2m1: ggml packs value p<16 in low nibble of qs[p], p>=16 in high nibble of
+    // qs[p-16]; emit consecutive-pair output bytes.
+    uint8_t * out_row = b_e2m1 + ((size_t)e * N + n) * (K / 2);
+    const int out_base = g * (QK_MXFP4 / 2);      // 16 bytes per 32-block
+    for (int b = 0; b < QK_MXFP4 / 2; b++) {
+        int p0 = 2 * b, p1 = 2 * b + 1;
+        uint8_t c0 = (p0 < 16) ? (qs[p0] & 0xF) : (qs[p0 - 16] >> 4);
+        uint8_t c1 = (p1 < 16) ? (qs[p1] & 0xF) : (qs[p1 - 16] >> 4);
+        out_row[out_base + b] = c0 | (c1 << 4);
+    }
+}
+
+extern "C" void ggml_cuda_mxfp4_repack_weights(
+        const void * src0_blocks, void * b_e2m1, void * sfb,
+        int E, int N, int K, size_t nb01, size_t nb02, cudaStream_t stream) {
+    const int nsubK = K / QK_MXFP4;
+    const long total = (long)E * N * nsubK;
+    const int threads = 256;
+    const int numKTiles = (K + 127) / 128;
+    const unsigned blocks = (unsigned)((total + threads - 1) / threads);
+    k_mxfp4_repack_weights<<<blocks, threads, 0, stream>>>(
+        (const uint8_t *) src0_blocks, (uint8_t *) b_e2m1, (uint8_t *) sfb,
+        E, N, K, nb01, nb02, numKTiles);
+}
+
+// Fused gather + MXFP4 quantize. One block per compact row m. No global scale:
+// each 32-block gets its own E8M0 (huge exponent range -> no underflow). Writes
+// row_scale[m]=1.0 so the shared scatter/rescale epilogue is a no-op multiply.
+__global__ void k_mxfp4_gather_quant(
+        const float * __restrict__ src1, const int32_t * __restrict__ ids_src1,
+        const int32_t * __restrict__ expert_bounds, const int32_t * __restrict__ sf_offsets,
+        float * __restrict__ row_scale, uint8_t * __restrict__ a_e2m1, uint8_t * __restrict__ sfa,
+        int E, int Mtot, int K, int64_t s11, int numKTiles) {
+    const int m = blockIdx.x;
+    if (m >= Mtot) return;
+    extern __shared__ float srow[];               // K floats (no reduce slots)
+    const float * xrow = src1 + (int64_t)(ids_src1 ? ids_src1[m] : m) * s11;
+
+    // pass 1: gather only (no block-wide amax needed for single-level MXFP4)
+    if (((uintptr_t) xrow & 15) == 0) {
+        const float4 * x4 = (const float4 *) xrow;
+        float4 * s4 = (float4 *) srow;
+        for (int k = threadIdx.x; k < K / 4; k += blockDim.x) s4[k] = x4[k];
+    } else {
+        for (int k = threadIdx.x; k < K; k += blockDim.x) srow[k] = xrow[k];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) row_scale[m] = 1.0f;    // MXFP4: single-level, no rescale
+
+    // expert id for row m: binary search in expert_bounds
+    int lo = 0, hi = E - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (expert_bounds[mid] <= m) lo = mid; else hi = mid - 1;
+    }
+    const int e = lo;
+    const int r = m - expert_bounds[e];
+    uint8_t * sfa_e   = sfa + (size_t) sf_offsets[e] * (K / QK_MXFP4);
+    uint8_t * out_row = a_e2m1 + (size_t) m * (K / 2);
+
+    // pass 2: quantize 32-blocks, one E8M0 scale each
+    const int nsubK = K / QK_MXFP4;
+    for (int gsub = threadIdx.x; gsub < nsubK; gsub += blockDim.x) {
+        const float * xb = srow + gsub * QK_MXFP4;
+        float sub_amax = 0.f;
+#pragma unroll
+        for (int j = 0; j < QK_MXFP4; j++) sub_amax = fmaxf(sub_amax, fabsf(xb[j]));
+        const uint8_t em0 = d_fp32_to_e8m0(sub_amax);
+        const float scale = d_e8m0_to_fp32(em0);
+        sfa_e[d_sf_swizzle(r, gsub, numKTiles)] = em0;
+        const int out_base = gsub * (QK_MXFP4 / 2);
+        const float invs = 1.0f / scale;
+#if __CUDA_ARCH__ >= 1200
+#pragma unroll
+        for (int b = 0; b < QK_MXFP4 / 2; b++) {
+            uint32_t byte_;
+            asm volatile("{\n\t.reg .b8 b8;\n\t"
+                         "cvt.rn.satfinite.e2m1x2.f32 b8, %2, %1;\n\t"
+                         "cvt.u32.u8 %0, b8;\n\t}"
+                         : "=r"(byte_)
+                         : "f"(xb[2 * b] * invs), "f"(xb[2 * b + 1] * invs));
+            out_row[out_base + b] = (uint8_t) byte_;
+        }
+#else
+#pragma unroll
+        for (int b = 0; b < QK_MXFP4 / 2; b++) {
+            const uint8_t c0 = d_e2m1_code(xb[2 * b],     scale);
+            const uint8_t c1 = d_e2m1_code(xb[2 * b + 1], scale);
+            out_row[out_base + b] = c0 | (c1 << 4);
+        }
+#endif
+    }
+}
+
+extern "C" void ggml_cuda_mxfp4_gather_quant(
+        const float * src1, const int32_t * ids_src1, const int32_t * expert_bounds,
+        const int32_t * sf_offsets, float * row_scale, void * a_e2m1, void * sfa,
+        int E, int Mtot, int K, int64_t s11, cudaStream_t stream) {
+    const int threads = 256;
+    const int numKTiles = (K + 127) / 128;
+    const size_t smem = (size_t) K * sizeof(float);
+    if (smem > 48 * 1024)
+        cudaFuncSetAttribute(k_mxfp4_gather_quant, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+    k_mxfp4_gather_quant<<<(unsigned) Mtot, threads, smem, stream>>>(
+        src1, ids_src1, expert_bounds, sf_offsets, row_scale,
+        (uint8_t *) a_e2m1, (uint8_t *) sfa, E, Mtot, K, s11, numKTiles);
+}
+
+// Fused SwiGLU + MXFP4 requant on SORTED rows. Row m: x[j]=silu(gate)*up, then
+// per-32-block E8M0 quantize. row_scale1 is 1.0 for MXFP4; row_scale2 out = 1.0.
+__global__ void k_mxfp4_swiglu_quant(
+        const uint16_t * __restrict__ dg, const uint16_t * __restrict__ du,
+        const float * __restrict__ row_scale1,
+        const int32_t * __restrict__ expert_bounds, const int32_t * __restrict__ sf_offsets,
+        float * __restrict__ row_scale2, uint8_t * __restrict__ a_e2m1, uint8_t * __restrict__ sfa,
+        int E, int Mtot, int K, int numKTiles) {
+    const int m = blockIdx.x;
+    if (m >= Mtot) return;
+    extern __shared__ float srow[];               // K floats
+    const float g1 = row_scale1[m];               // 1.0 for MXFP4
+    const uint16_t * grow_ = dg + (size_t) m * K;
+    const uint16_t * urow_ = du + (size_t) m * K;
+    for (int j = threadIdx.x; j < K; j += blockDim.x) {
+        uint32_t bg = (uint32_t) grow_[j] << 16, bu = (uint32_t) urow_[j] << 16;
+        float xg, xu; memcpy(&xg, &bg, 4); memcpy(&xu, &bu, 4);
+        xg *= g1; xu *= g1;
+        srow[j] = (xg / (1.0f + expf(-xg))) * xu;  // silu(gate)*up
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) row_scale2[m] = 1.0f;
+
+    int lo = 0, hi = E - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (expert_bounds[mid] <= m) lo = mid; else hi = mid - 1;
+    }
+    const int e = lo;
+    const int r = m - expert_bounds[e];
+    uint8_t * sfa_e   = sfa + (size_t) sf_offsets[e] * (K / QK_MXFP4);
+    uint8_t * out_row = a_e2m1 + (size_t) m * (K / 2);
+
+    const int nsubK = K / QK_MXFP4;
+    for (int gsub = threadIdx.x; gsub < nsubK; gsub += blockDim.x) {
+        const float * xb = srow + gsub * QK_MXFP4;
+        float sub_amax = 0.f;
+#pragma unroll
+        for (int j = 0; j < QK_MXFP4; j++) sub_amax = fmaxf(sub_amax, fabsf(xb[j]));
+        const uint8_t em0 = d_fp32_to_e8m0(sub_amax);
+        const float scale = d_e8m0_to_fp32(em0);
+        sfa_e[d_sf_swizzle(r, gsub, numKTiles)] = em0;
+        const int out_base = gsub * (QK_MXFP4 / 2);
+        const float invs = 1.0f / scale;
+#if __CUDA_ARCH__ >= 1200
+#pragma unroll
+        for (int b = 0; b < QK_MXFP4 / 2; b++) {
+            uint32_t byte_;
+            asm volatile("{\n\t.reg .b8 b8;\n\t"
+                         "cvt.rn.satfinite.e2m1x2.f32 b8, %2, %1;\n\t"
+                         "cvt.u32.u8 %0, b8;\n\t}"
+                         : "=r"(byte_)
+                         : "f"(xb[2 * b] * invs), "f"(xb[2 * b + 1] * invs));
+            out_row[out_base + b] = (uint8_t) byte_;
+        }
+#else
+#pragma unroll
+        for (int b = 0; b < QK_MXFP4 / 2; b++) {
+            const uint8_t c0 = d_e2m1_code(xb[2 * b],     scale);
+            const uint8_t c1 = d_e2m1_code(xb[2 * b + 1], scale);
+            out_row[out_base + b] = c0 | (c1 << 4);
+        }
+#endif
+    }
+}
+
+extern "C" void ggml_cuda_mxfp4_swiglu_quant(
+        const void * d_gate_bf16, const void * d_up_bf16, const float * row_scale1,
+        const int32_t * expert_bounds, const int32_t * sf_offsets,
+        float * row_scale2, void * a_e2m1, void * sfa,
+        int E, int Mtot, int K, cudaStream_t stream) {
+    const int threads = 256;
+    const int numKTiles = (K + 127) / 128;
+    const size_t smem = (size_t) K * sizeof(float);
+    if (smem > 48 * 1024)
+        cudaFuncSetAttribute(k_mxfp4_swiglu_quant, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+    k_mxfp4_swiglu_quant<<<(unsigned) Mtot, threads, smem, stream>>>(
+        (const uint16_t *) d_gate_bf16, (const uint16_t *) d_up_bf16, row_scale1,
+        expert_bounds, sf_offsets, row_scale2,
+        (uint8_t *) a_e2m1, (uint8_t *) sfa, E, Mtot, K, numKTiles);
+}
+
+
 // scatter + rescale + bf16->f32: one block per compact row, vectorized 4-wide.
 // N % 4 == 0 always holds here (N is a multiple of 128 per _supported()).
 // accum=false: dst row = ids_dst[m], overwrite (plain scatter).
@@ -633,7 +885,8 @@ extern "C" void ggml_cuda_moe_invert_ids(const int32_t * ids_dst, int32_t * inv,
 __global__ void k_gather_accum_rowscaled(
         const uint16_t * __restrict__ src, const float * __restrict__ row_scale,
         const int32_t * __restrict__ inv, float * __restrict__ dst,
-        int n_tokens, int N, int64_t s1, const float * __restrict__ fuse_w, int neu) {
+        int n_tokens, int N, int64_t s1, const float * __restrict__ fuse_w, int neu,
+        const float * __restrict__ residual, int64_t rs1) {
     const int t = blockIdx.x;
     if (t >= n_tokens) return;
     __shared__ int   s_m[16];
@@ -648,6 +901,9 @@ __global__ void k_gather_accum_rowscaled(
     }
     __syncthreads();
     float * drow = dst + (int64_t) t * s1;
+    // fused residual add: dst = residual + sum_experts (eliminates the trailing
+    // GGML_OP_ADD node + one full HBM write/read round-trip of the hidden state).
+    const float4 * rrow = residual ? (const float4 *) (residual + (int64_t) t * rs1) : nullptr;
     const bool aligned = ((uintptr_t) drow & 15) == 0;
     for (int n4 = threadIdx.x; n4 < N / 4; n4 += blockDim.x) {
         float4 acc = {0.f, 0.f, 0.f, 0.f};
@@ -660,6 +916,10 @@ __global__ void k_gather_accum_rowscaled(
             b = (uint32_t) v.y << 16; memcpy(&f, &b, 4); acc.y += f * g;
             b = (uint32_t) v.z << 16; memcpy(&f, &b, 4); acc.z += f * g;
             b = (uint32_t) v.w << 16; memcpy(&f, &b, 4); acc.w += f * g;
+        }
+        if (rrow) {
+            const float4 r = rrow[n4];   // residual is contiguous f32, N%4==0
+            acc.x += r.x; acc.y += r.y; acc.z += r.z; acc.w += r.w;
         }
         if (aligned) {
             ((float4 *) drow)[n4] = acc;
@@ -687,9 +947,10 @@ extern "C" void ggml_cuda_nvfp4_scatter_rowscaled(
 extern "C" void ggml_cuda_nvfp4_gather_accum_rowscaled(
         const void * d_bf16, const float * row_scale, const int32_t * inv,
         float * dst, int n_tokens, int N, int64_t s1, const float * fuse_w, int neu,
-        cudaStream_t stream) {
+        const float * residual, int64_t rs1, cudaStream_t stream) {
     k_gather_accum_rowscaled<<<(unsigned) n_tokens, 256, 0, stream>>>(
-        (const uint16_t *) d_bf16, row_scale, inv, dst, n_tokens, N, s1, fuse_w, neu);
+        (const uint16_t *) d_bf16, row_scale, inv, dst, n_tokens, N, s1, fuse_w, neu,
+        residual, rs1);
 }
 // ============================================================================
 // F16 MoE prefill glue (2026-07-02): gather f32->f16, scatter f32->f32

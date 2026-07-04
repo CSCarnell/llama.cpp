@@ -101,7 +101,36 @@ int ggml_cuda_cutlass_moe_nvfp4_ffn(
     int64_t s11, int64_t s1,
     size_t g_nb01, size_t g_nb02, size_t u_nb01, size_t u_nb02,
     size_t d_nb01, size_t d_nb02,
-    const float * fuse_w, int accum_neu, cudaStream_t stream);
+    const float * fuse_w, int accum_neu,
+    const float * residual, int64_t res_s1, cudaStream_t stream);
+
+// ===================== MXFP4 variants =====================
+// Same ABI as the nvfp4 entries above, built from cutlass-moe-mxfp4.cu (which
+// includes cutlass-moe-fp4.cu with FC_FP4_MX). MXFP4 = e2m1 codes * ue8m0 block
+// scale (block-32, 1 level). _supported requires K % 128 == 0 (SF atom) and
+// N % 128 == 0. The base sorted-input entry is intentionally omitted (that path
+// falls back to MMQ for MXFP4; only the fused/grouped/dense paths are ported).
+int ggml_cuda_cutlass_moe_mxfp4_supported(int E, int N, int K);
+
+int ggml_cuda_cutlass_dense_mxfp4(
+    const void * w_blocks, const float * src1, float * dst,
+    int N, int K, int M, int64_t s11, int64_t s1,
+    size_t nb01, size_t nb02, cudaStream_t stream);
+
+int ggml_cuda_cutlass_moe_mxfp4_prefill(
+    const void * w_blocks, const float * src1, const ggml_cuda_moe_ids_args * ids,
+    float * dst, int E, int N, int K, int Mtot, int64_t s11, int64_t s1,
+    size_t nb01, size_t nb02, const float * fuse_w, int accum_neu, cudaStream_t stream);
+
+int ggml_cuda_cutlass_moe_mxfp4_ffn(
+    const void * w_gate, const void * w_up, const void * w_down,
+    const float * src1, const ggml_cuda_moe_ids_args * ids,
+    float * dst, int E, int N_gu, int K, int N_out, int Mtot,
+    int64_t s11, int64_t s1,
+    size_t g_nb01, size_t g_nb02, size_t u_nb01, size_t u_nb02,
+    size_t d_nb01, size_t d_nb02,
+    const float * fuse_w, int accum_neu,
+    const float * residual, int64_t res_s1, cudaStream_t stream);
 
 #ifdef __cplusplus
 }
