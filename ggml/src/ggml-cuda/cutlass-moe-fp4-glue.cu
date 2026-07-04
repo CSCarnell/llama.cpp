@@ -148,6 +148,25 @@ __global__ void k_repack_weights(
     }
 }
 
+// ============================================================================
+// DO NOT ATTEMPT to fuse swiglu_quant into the gate/up GEMM epilogue via CUTLASS
+// EVT. It is STRUCTURALLY IMPOSSIBLE with a single-pass epilogue, for two
+// independent reasons (verified 2026-07-03):
+//   (1) CROSS-CTA ROW REDUCTION. The FP4 activation quant needs a per-ROW global
+//       scale g[m] = row_amax/2688 (k_act_row_scale below) reduced over the
+//       ENTIRE N_ff row. That row is tiled across multiple CTAs; a CUTLASS
+//       epilogue CTA only sees its own N-tile, so the row-global amax cannot be
+//       formed without a second pass (which reintroduces the HBM round-trip the
+//       fusion was meant to remove).
+//   (2) GATE/UP COLUMNS IN DIFFERENT CTAs. silu(gate[n])*up[n] needs gate col n
+//       AND up col N_ff+n from the concatenated [gate|up] GEMM output -- these
+//       live in different N-tiles/CTAs, so even the swiglu *elementwise* is not a
+//       tile-local epilogue.
+// The reachable epilogue fusion (dense-proj bf16->f32 rowscale) is already landed
+// in cutlass-moe-fp4.cu. Next perf lever is the MoE grouped-GEMM SCHEDULE
+// (expert-batching to raise per-expert M), NOT further glue-epilogue fusion.
+// ============================================================================
+
 // ----------------------------------------------------------------------------
 // per-row global scale g[m] = row_amax / 2688  (2688 = 6 * 448 = e2m1_max * e4m3_max)
 // one CUDA block per row; block-stride reduction over K with shared-mem reduce.

@@ -347,7 +347,16 @@ static bool fcfa_run_fp8(
         amax_o->set_output(true).set_uid(UID_AMAX_O).set_data_type(fe::DataType_t::FLOAT)
           .set_dim({1,1,1,1}).set_stride({1,1,1,1});
 
-        auto bst = graph->build(st.handle, {fe::HeurMode_t::A});
+        // FP8 sdpa plan selection. Default HeurMode A (cuDNN top heuristic pick).
+        // FC_FA_HEUR=1 -> try exhaustive HeurMode B first (may surface a faster
+        // large-seqlen prefill plan than the default 64x64x128 knob_3), then fall
+        // back to A. A/B lever for the ~30%-of-prefill attention cost (2026-07-03).
+        static const std::vector<fe::HeurMode_t> fc_fa_heur = []{
+            const char * e = getenv("FC_FA_HEUR");
+            if (e && atoi(e) == 1) return std::vector<fe::HeurMode_t>{fe::HeurMode_t::B, fe::HeurMode_t::A};
+            return std::vector<fe::HeurMode_t>{fe::HeurMode_t::A};
+        }();
+        auto bst = graph->build(st.handle, fc_fa_heur);
         if (!bst.is_good()) {
             ent.build_failed = true;
             if (fcfa_log_enabled()) {
