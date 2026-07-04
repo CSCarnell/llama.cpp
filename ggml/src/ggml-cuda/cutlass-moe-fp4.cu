@@ -22,12 +22,49 @@
 
 using namespace cute;
 
-// ===================== grouped NVFP4 -> bf16 type config (matches validated kernel) =====================
+// ============================================================================
+// Format selection. This TU is compiled TWICE: once as-is (NVFP4, nv_float4_t,
+// e4m3 SF, block-16) and once via cutlass-moe-mxfp4.cu which does
+//   #define FC_FP4_MX 1
+//   #include "cutlass-moe-fp4.cu"
+// to build the MXFP4 variant (mx_float4_t, e8m0 SF, block-32). All file-scope
+// helpers are `static` (internal linkage), so the two object files never collide;
+// only the extern "C" entry points differ (FP4_SYM below picks the name).
+//   NVFP4: e2m1 codes * ue4m3(sub) * g[row]   (2-level, block-16, numKTiles=K/64)
+//   MXFP4: e2m1 codes * ue8m0(block)          (1-level, block-32, numKTiles=K/128)
+// The glue kernels, SF layout (Sm1xxBlkScaledConfig::tile_atom_to_shape_SF*), and
+// ElementSF type are all derived from the FP4_ELEM type + QSUB, so the body is shared.
+// ============================================================================
+#ifdef FC_FP4_MX
+  #define FP4_ELEM             cutlass::mx_float4_t<ElementInput>
+  #define QSUB_VAL             32
+  #define FP4_SUPPORTED_KMULT  128            // MXFP4 SF atom needs K % 128 == 0
+  // Preprocessor-rename every extern "C" entry + format-specific glue call from
+  // its nvfp4 spelling to the mxfp4 one. This rewrites BOTH the definitions in
+  // this TU and every internal call site in one place, so the shared body below
+  // stays untouched. Format-INDEPENDENT glue (sf_offsets, scatter_rowscaled,
+  // gather_accum_rowscaled, act_row_scale, quant_acts, moe_routing_*) is NOT
+  // listed here and keeps its nvfp4 symbol (same code serves both builds).
+  #define ggml_cuda_cutlass_moe_nvfp4_ffn        ggml_cuda_cutlass_moe_mxfp4_ffn
+  #define ggml_cuda_cutlass_moe_nvfp4_prefill    ggml_cuda_cutlass_moe_mxfp4_prefill
+  #define ggml_cuda_cutlass_moe_nvfp4_supported  ggml_cuda_cutlass_moe_mxfp4_supported
+  #define ggml_cuda_cutlass_dense_nvfp4          ggml_cuda_cutlass_dense_mxfp4
+  #define ggml_cuda_cutlass_moe_nvfp4            ggml_cuda_cutlass_moe_mxfp4
+  #define ggml_cuda_nvfp4_gather_quant           ggml_cuda_mxfp4_gather_quant
+  #define ggml_cuda_nvfp4_swiglu_quant           ggml_cuda_mxfp4_swiglu_quant
+  #define ggml_cuda_nvfp4_repack_weights         ggml_cuda_mxfp4_repack_weights
+#else
+  #define FP4_ELEM             cutlass::nv_float4_t<ElementInput>
+  #define QSUB_VAL             16
+  #define FP4_SUPPORTED_KMULT  64             // NVFP4 block = 64
+#endif
+
+// ===================== grouped FP4 -> bf16 type config (matches validated kernel) =====================
 using ElementInput   = cutlass::float_e2m1_t;
-using ElementA       = cutlass::nv_float4_t<ElementInput>;
+using ElementA       = FP4_ELEM;
 using LayoutATag     = cutlass::layout::RowMajor;
 static constexpr int AlignmentA = 32;
-using ElementB       = cutlass::nv_float4_t<ElementInput>;
+using ElementB       = FP4_ELEM;
 using LayoutBTag     = cutlass::layout::ColumnMajor;
 static constexpr int AlignmentB = 32;
 using ElementD       = cutlass::bfloat16_t;
@@ -39,8 +76,27 @@ using ElementAccumulator = float;
 using ArchTag        = cutlass::arch::Sm120;
 using OperatorClass  = cutlass::arch::OpClassBlockScaledTensorOp;
 using ThreadBlockShape = Shape<_128,_128,_128>;  // optimal: swept K256 M256 N256 M64(no-compile) N64 all slower (2026-07-02)
-using ClusterShape   = Shape<_1,_1,_1>;
+using ClusterShape   = Shape<_1,_1,_1>;  // Sm120 forbids multicast (static_assert): cluster MUST be 1
 using ProblemShape   = cutlass::gemm::GroupProblemShape<Shape<int,int,int>>;
+
+// ---- MoE grouped-GEMM kernel SCHEDULE A/B switch (2026-07-03) ----
+// MEASURED RESULT (NVFP4 pp8192 -ub4096 -r3): Pingpong = 28,329 t/s vs
+// Cooperative baseline 28,362 t/s -> FLAT (within noise). Confirmed ENGAGED on
+// the hot whole-FFN path via FCMOE_DEBUG "WHOLE-FFN fusion ACTIVE" (rc==0, i.e.
+// can_implement succeeded on the PtrArray Pingpong-scheduled grouped GEMM).
+// Conclusion: 2x-tiles-in-flight does NOT lift throughput here -> the grouped
+// MoE GEMM is not tile-count/occupancy limited in a way Pingpong addresses.
+// Default reverted to Cooperative (validated baseline). Set FC_MOE_PINGPONG=1
+// to re-test. tile-N=128>=16 satisfies the PtrArray Pingpong guard.
+#ifndef FC_MOE_PINGPONG
+#define FC_MOE_PINGPONG 0
+#endif
+#if FC_MOE_PINGPONG
+using MoEKernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong;
+#else
+using MoEKernelSchedule = cutlass::gemm::collective::KernelScheduleAuto;
+#endif
+
 
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
     ArchTag, OperatorClass, ThreadBlockShape, ClusterShape,
@@ -57,7 +113,7 @@ using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder
     ElementAccumulator, ThreadBlockShape, ClusterShape,
     cutlass::gemm::collective::StageCountAutoCarveout<
         static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-    cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+    MoEKernelSchedule>::CollectiveOp;
 
 using GemmKernel = cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop, CollectiveEpilogue>;
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
@@ -73,7 +129,7 @@ using ElementSF = typename Gemm::GemmKernel::CollectiveMainloop::ElementSF;
 using ElementAData = typename ElementA::DataType;
 using ElementBData = typename ElementB::DataType;
 
-#define QSUB 16
+#define QSUB QSUB_VAL
 
 // ===================== persistent weight-repack cache =====================
 struct WeightCache { void* dB=nullptr; void* dSFB=nullptr; int E=0,N=0,K=0; };
@@ -122,8 +178,8 @@ template<class V> static void* upload(const V& v, cudaStream_t s){
 
 extern "C" int ggml_cuda_cutlass_moe_nvfp4_supported(int E, int N, int K){
     if (E <= 0 || N <= 0 || K <= 0) return 0;
-    if (N % 128 != 0) return 0;      // SFB swizzle atom = 128 rows
-    if (K % 64  != 0) return 0;      // NVFP4 block = 64
+    if (N % 128 != 0) return 0;                 // SFB swizzle atom = 128 rows
+    if (K % FP4_SUPPORTED_KMULT != 0) return 0; // FP4 block/SF-atom K granularity
     return 1;
 }
 
@@ -132,6 +188,11 @@ extern "C" int ggml_cuda_cutlass_moe_nvfp4(
         const int32_t * tokens_per_expert, int E, int N, int K,
         size_t nb01, size_t nb02, cudaStream_t stream) {
     if (!ggml_cuda_cutlass_moe_nvfp4_supported(E, N, K)) return 1;
+#ifdef FC_FP4_MX
+    return 1;   // MXFP4: only the fused _ffn path is implemented. The sorted-input
+                // path below uses the 2-level act_row_scale/quant_acts glue which has
+                // no MX variant, so fall back to MMQ here (never silently wrong).
+#endif
 
     // row/expert bookkeeping (host)
     std::vector<int32_t> expert_off(E), sf_off(E);
@@ -262,7 +323,7 @@ extern "C" int ggml_cuda_cutlass_moe_nvfp4(
 // ============================================================================
 
 // one thread per expert: fill grouped-GEMM argument arrays from device bounds
-__global__ void k_build_group_args(
+static __global__ void k_build_group_args(
         const int32_t * __restrict__ expert_bounds, const int32_t * __restrict__ sf_offsets,
         const uint8_t * wB, const uint8_t * wSFB,
         const uint8_t * dAq, const uint8_t * dSFA, ElementD * dD,
@@ -292,13 +353,27 @@ __global__ void k_build_group_args(
     lb[e]   = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(Me, N, K, 1));
 }
 
+
 // ---------------------------------------------------------------------------
 // shared routing cache: gate/up/down of one MoE layer call mul_mat_id with the
 // SAME ids tensor -> compute mm_ids_helper once, reuse <=3 times (then forced
 // recompute; the allocator may hand the next layer's ids the same address, so
 // the use cap is the only thing preventing stale-routing poisoning — 3 matches
 // gate/up/down exactly).
+//
+// These two functions have EXTERNAL linkage and are shared across TUs
+// (cutlass-moe-f16.cu calls routing_get). The MXFP4 TU is a #include of this
+// file, so their definitions would be emitted twice -> multiple-definition link
+// error. Guard the definitions to the NVFP4 TU only; the MXFP4 TU (and the f16
+// TU) link against that single copy via the forward declarations below.
 // ---------------------------------------------------------------------------
+extern "C" void ggml_cuda_moe_routing_get(
+        const ggml_cuda_moe_ids_args * a, cudaStream_t stream,
+        const int32_t ** ids_src1, const int32_t ** ids_dst,
+        const int32_t ** bounds, uint64_t * generation);
+extern "C" void ggml_cuda_moe_routing_expire(void);
+
+#ifndef FC_FP4_MX
 struct MoeRouting {
     int32_t * buf = nullptr; size_t cap = 0;      // holds ids_src1 + ids_dst + bounds
     int32_t * ids_src1 = nullptr, * ids_dst = nullptr, * bounds = nullptr;
@@ -375,6 +450,7 @@ extern "C" void ggml_cuda_moe_routing_expire(void) {
     std::lock_guard<std::mutex> lk(g_rt_mtx);
     g_rt.uses = 1000;
 }
+#endif // FC_FP4_MX (routing cache defined once in the NVFP4 TU)
 
 // persistent grow-only scratch (single device assumed; guarded by mutex)
 struct PrefillScratch {
@@ -528,25 +604,26 @@ extern "C" int ggml_cuda_cutlass_moe_nvfp4_prefill(
             2 * sizeof(void *) + 2 * sizeof(void *) + 2 * sizeof(void *) +
             sizeof(StrideA) + sizeof(StrideB) + sizeof(StrideC) + sizeof(StrideD) +
             sizeof(LayoutSFA) + sizeof(LayoutSFB) + sizeof(int32_t);
-        if (cudaMalloc(&g_pf.args_blob, (per_e + 64) * (size_t) E) != cudaSuccess) { // slack for 16B alignment carving
+        const int Ecap = E;
+        if (cudaMalloc(&g_pf.args_blob, (per_e + 64) * (size_t) Ecap) != cudaSuccess) { // slack for 16B alignment carving
             cudaGetLastError(); g_pf.args_blob = nullptr; return 1; // OOM -> fall back
         }
         uint8_t * base = (uint8_t *) g_pf.args_blob;
         auto carve = [&](size_t bytes) { void * r = base; base += (bytes + 15) & ~size_t(15); return r; };
-        g_pf.ps   = (typename ProblemShape::UnderlyingProblemShape *) carve(sizeof(*g_pf.ps) * E);
-        g_pf.pA   = (const ElementAData **) carve(sizeof(void *) * E);
-        g_pf.pB   = (const ElementBData **) carve(sizeof(void *) * E);
-        g_pf.pC   = (const ElementC **)     carve(sizeof(void *) * E);
-        g_pf.pD   = (ElementD **)           carve(sizeof(void *) * E);
-        g_pf.pSFA = (const ElementSF **)    carve(sizeof(void *) * E);
-        g_pf.pSFB = (const ElementSF **)    carve(sizeof(void *) * E);
-        g_pf.sa   = (StrideA *)   carve(sizeof(StrideA) * E);
-        g_pf.sb   = (StrideB *)   carve(sizeof(StrideB) * E);
-        g_pf.sc   = (StrideC *)   carve(sizeof(StrideC) * E);
-        g_pf.sd   = (StrideD *)   carve(sizeof(StrideD) * E);
-        g_pf.la   = (LayoutSFA *) carve(sizeof(LayoutSFA) * E);
-        g_pf.lb   = (LayoutSFB *) carve(sizeof(LayoutSFB) * E);
-        g_pf.sf_off = (int32_t *) carve(sizeof(int32_t) * E);
+        g_pf.ps   = (typename ProblemShape::UnderlyingProblemShape *) carve(sizeof(*g_pf.ps) * Ecap);
+        g_pf.pA   = (const ElementAData **) carve(sizeof(void *) * Ecap);
+        g_pf.pB   = (const ElementBData **) carve(sizeof(void *) * Ecap);
+        g_pf.pC   = (const ElementC **)     carve(sizeof(void *) * Ecap);
+        g_pf.pD   = (ElementD **)           carve(sizeof(void *) * Ecap);
+        g_pf.pSFA = (const ElementSF **)    carve(sizeof(void *) * Ecap);
+        g_pf.pSFB = (const ElementSF **)    carve(sizeof(void *) * Ecap);
+        g_pf.sa   = (StrideA *)   carve(sizeof(StrideA) * Ecap);
+        g_pf.sb   = (StrideB *)   carve(sizeof(StrideB) * Ecap);
+        g_pf.sc   = (StrideC *)   carve(sizeof(StrideC) * Ecap);
+        g_pf.sd   = (StrideD *)   carve(sizeof(StrideD) * Ecap);
+        g_pf.la   = (LayoutSFA *) carve(sizeof(LayoutSFA) * Ecap);
+        g_pf.lb   = (LayoutSFB *) carve(sizeof(LayoutSFB) * Ecap);
+        g_pf.sf_off = (int32_t *) carve(sizeof(int32_t) * Ecap);
         g_pf.E_cap = E;
     }
     const size_t sf_rows = (size_t) Mtot + 128 * (size_t) E;    // worst-case round-up padding
@@ -612,7 +689,8 @@ extern "C" int ggml_cuda_cutlass_moe_nvfp4_prefill(
         if (!g_pf.dInv) return 1; // scratch OOM -> fall back to MMQ
         ggml_cuda_moe_invert_ids(ids_dst, g_pf.dInv, Mtot, stream);
         ggml_cuda_nvfp4_gather_accum_rowscaled(g_pf.dD, g_pf.dG, g_pf.dInv, dst,
-                                               Mtot / accum_neu, N, s1, fuse_w, accum_neu, stream);
+                                               Mtot / accum_neu, N, s1, fuse_w, accum_neu,
+                                               nullptr, 0, stream);
     } else {
         if (accum_neu > 0) {
             cudaMemsetAsync(dst, 0, (size_t) (Mtot / accum_neu) * s1 * sizeof(float), stream);
@@ -668,9 +746,10 @@ extern "C" int ggml_cuda_cutlass_moe_nvfp4_ffn(
         const float * src1, const ggml_cuda_moe_ids_args * ids,
         float * dst, int E, int N_gu, int K, int N_out, int Mtot,
         int64_t s11, int64_t s1,
-        size_t g_nb01, size_t g_nb02, size_t u_nb01, size_t u_nb02,
-        size_t d_nb01, size_t d_nb02,
-        const float * fuse_w, int accum_neu, cudaStream_t stream) {
+    size_t g_nb01, size_t g_nb02, size_t u_nb01, size_t u_nb02,
+    size_t d_nb01, size_t d_nb02,
+    const float * fuse_w, int accum_neu,
+    const float * residual, int64_t res_s1, cudaStream_t stream) {
     if (!ggml_cuda_cutlass_moe_nvfp4_supported(E, N_gu, K) ||
         !ggml_cuda_cutlass_moe_nvfp4_supported(E, N_out, N_gu)) return 1;
     if (Mtot <= 0 || E > 1024) return 1;
@@ -699,25 +778,26 @@ extern "C" int ggml_cuda_cutlass_moe_nvfp4_ffn(
             6 * sizeof(void *) +
             sizeof(StrideA) + sizeof(StrideB) + sizeof(StrideC) + sizeof(StrideD) +
             sizeof(LayoutSFA) + sizeof(LayoutSFB) + sizeof(int32_t);
-        if (cudaMalloc(&g_pf.args_blob, (per_e + 64) * (size_t) E) != cudaSuccess) {
+        const int Ecap = E;
+        if (cudaMalloc(&g_pf.args_blob, (per_e + 64) * (size_t) Ecap) != cudaSuccess) {
             cudaGetLastError(); g_pf.args_blob = nullptr; return 1; // OOM -> fall back
         }
         uint8_t * base = (uint8_t *) g_pf.args_blob;
         auto carve = [&](size_t bytes) { void * r = base; base += (bytes + 15) & ~size_t(15); return r; };
-        g_pf.ps   = (typename ProblemShape::UnderlyingProblemShape *) carve(sizeof(*g_pf.ps) * E);
-        g_pf.pA   = (const ElementAData **) carve(sizeof(void *) * E);
-        g_pf.pB   = (const ElementBData **) carve(sizeof(void *) * E);
-        g_pf.pC   = (const ElementC **)     carve(sizeof(void *) * E);
-        g_pf.pD   = (ElementD **)           carve(sizeof(void *) * E);
-        g_pf.pSFA = (const ElementSF **)    carve(sizeof(void *) * E);
-        g_pf.pSFB = (const ElementSF **)    carve(sizeof(void *) * E);
-        g_pf.sa   = (StrideA *)   carve(sizeof(StrideA) * E);
-        g_pf.sb   = (StrideB *)   carve(sizeof(StrideB) * E);
-        g_pf.sc   = (StrideC *)   carve(sizeof(StrideC) * E);
-        g_pf.sd   = (StrideD *)   carve(sizeof(StrideD) * E);
-        g_pf.la   = (LayoutSFA *) carve(sizeof(LayoutSFA) * E);
-        g_pf.lb   = (LayoutSFB *) carve(sizeof(LayoutSFB) * E);
-        g_pf.sf_off = (int32_t *) carve(sizeof(int32_t) * E);
+        g_pf.ps   = (typename ProblemShape::UnderlyingProblemShape *) carve(sizeof(*g_pf.ps) * Ecap);
+        g_pf.pA   = (const ElementAData **) carve(sizeof(void *) * Ecap);
+        g_pf.pB   = (const ElementBData **) carve(sizeof(void *) * Ecap);
+        g_pf.pC   = (const ElementC **)     carve(sizeof(void *) * Ecap);
+        g_pf.pD   = (ElementD **)           carve(sizeof(void *) * Ecap);
+        g_pf.pSFA = (const ElementSF **)    carve(sizeof(void *) * Ecap);
+        g_pf.pSFB = (const ElementSF **)    carve(sizeof(void *) * Ecap);
+        g_pf.sa   = (StrideA *)   carve(sizeof(StrideA) * Ecap);
+        g_pf.sb   = (StrideB *)   carve(sizeof(StrideB) * Ecap);
+        g_pf.sc   = (StrideC *)   carve(sizeof(StrideC) * Ecap);
+        g_pf.sd   = (StrideD *)   carve(sizeof(StrideD) * Ecap);
+        g_pf.la   = (LayoutSFA *) carve(sizeof(LayoutSFA) * Ecap);
+        g_pf.lb   = (LayoutSFB *) carve(sizeof(LayoutSFB) * Ecap);
+        g_pf.sf_off = (int32_t *) carve(sizeof(int32_t) * Ecap);
         g_pf.E_cap = E;
     }
     const size_t sf_rows = (size_t) Mtot + 128 * (size_t) E;
@@ -738,6 +818,10 @@ extern "C" int ggml_cuda_cutlass_moe_nvfp4_ffn(
     ggml_cuda_nvfp4_gather_quant(src1, ids_src1, bounds, g_pf.sf_off,
                                  g_pf.dG, g_pf.dAq, g_pf.dSFA, E, Mtot, K, s11, stream);
     // ---- gate & up GEMMs (sorted bf16 outputs) ----
+    // NOTE: merging these into one 2E-group GEMM (run_group_gemm_gu_locked) was
+    // measured -3.9% (28.1k vs 29.2k) — the grouped-GEMM group-iteration overhead
+    // outweighs the halved launch count. Two separate E-group GEMMs pipeline
+    // better on sm_120. Kept as separate calls.
     int rc;
     if ((rc = run_group_gemm_locked(wcg, bounds, g_pf.sf_off, g_pf.dAq, g_pf.dSFA, g_pf.dD1, E, N_gu, K, stream)) != 0) return rc;
     if ((rc = run_group_gemm_locked(wcu, bounds, g_pf.sf_off, g_pf.dAq, g_pf.dSFA, g_pf.dD2, E, N_gu, K, stream)) != 0) return rc;
@@ -753,7 +837,8 @@ extern "C" int ggml_cuda_cutlass_moe_nvfp4_ffn(
         if (!g_pf.dInv) return 1; // scratch OOM -> fall back to MMQ
         ggml_cuda_moe_invert_ids(ids_dst, g_pf.dInv, Mtot, stream);
         ggml_cuda_nvfp4_gather_accum_rowscaled(g_pf.dD, g_pf.dG2, g_pf.dInv, dst,
-                                               Mtot / accum_neu, N_out, s1, fuse_w, accum_neu, stream);
+                                               Mtot / accum_neu, N_out, s1, fuse_w, accum_neu,
+                                               residual, res_s1, stream);
     } else {
         if (accum_neu > 0) {
             cudaMemsetAsync(dst, 0, (size_t) (Mtot / accum_neu) * s1 * sizeof(float), stream);
