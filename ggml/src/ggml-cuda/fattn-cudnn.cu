@@ -581,7 +581,11 @@ bool ggml_cuda_flash_attn_ext_cudnn_try(ggml_backend_cuda_context & ctx, ggml_te
     // pays off once attention's quadratic term dominates. Measured crossover ~4k
     // (pp2048 FP8 slower, pp8192 FP8 +6.3% NVFP4 / +4.4% MXFP4). Below the
     // threshold, stay on the validated HALF path so FP8 is never a regression.
-    static const bool fcfa_use_fp8 = getenv("GGML_CUDA_CUDNN_FA_FP8") != nullptr;
+    // FP8 (E4M3) attention default-ON: validated +9.1% NVFP4 prefill at pp8192, needle
+    // retrieval correct at 21k-token context. Gated to seq_kv>=fcfa_fp8_min_kv (4096) so
+    // short-context and decode stay byte-identical on the HALF path, and any FP8
+    // build/execute failure falls through to HALF below. Escape hatch: GGML_CUDA_CUDNN_FA_FP8_OFF.
+    static const bool fcfa_use_fp8 = getenv("GGML_CUDA_CUDNN_FA_FP8_OFF") == nullptr;
     static const int64_t fcfa_fp8_min_kv = [] {
         const char * s = getenv("GGML_CUDA_CUDNN_FA_FP8_MIN_KV");
         return s ? atoll(s) : 4096;
