@@ -245,6 +245,12 @@ function(hf_download version out_var out_resolved)
 endfunction()
 
 function(emit_files dist_dir)
+    # Prebuilt HF bundles have occasionally omitted the server's required loading
+    # fallback. Restore canonical static assets before gzip/embed so clean builds
+    # cannot fail based on bundle contents.
+    if(NOT EXISTS "${dist_dir}/loading.html" AND EXISTS "${UI_SOURCE_DIR}/static/loading.html")
+        file(COPY "${UI_SOURCE_DIR}/static/loading.html" DESTINATION "${dist_dir}")
+    endif()
     # If gzip is requested, compress every asset into a parallel _gzip/ tree
     # the structure stays the same; for ex: /abc/def --> /_gzip/abc/def
     # embed.cpp will check for _gzip and will pick it up

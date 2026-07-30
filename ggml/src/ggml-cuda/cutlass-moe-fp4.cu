@@ -176,6 +176,7 @@ using GemmDense = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelDense>;
 struct WeightCache { void* dB=nullptr; void* dSFB=nullptr; int E=0,N=0,K=0; };
 static std::mutex g_wc_mtx;
 static std::unordered_map<const void*, WeightCache> g_wc;
+static bool g_wc_headroom_warned = false;
 
 static const WeightCache& get_repacked_weights(
         const void* w_blocks, int E, int N, int K, size_t nb01, size_t nb02, cudaStream_t stream) {
@@ -185,9 +186,28 @@ static const WeightCache& get_repacked_weights(
     WeightCache wc; wc.E=E; wc.N=N; wc.K=K;
     size_t Bsz   = (size_t)E * N * (K/2);
     size_t SFBsz = (size_t)E * N * (K/QSUB);
-    // MUST check: at large ubatch/context the pool can leave too little VRAM and
-    // cudaMalloc fails -> unchecked nullptr write -> sticky illegal memory access
-    // (the ub>=2048 crash). On OOM cache a null entry so callers fall back to MMQ.
+    // Repacked weights persist for the process lifetime. On 70+ GiB models, caching
+    // until cudaMalloc itself fails consumes the compute workspace and makes the
+    // subsequent MMQ fallback abort too. Preserve configurable headroom before
+    // allocating any part of this tensor; smaller models still take the fast path.
+    static const size_t min_free = [] {
+        const char * value = getenv("GGML_CUDA_CUTLASS_REPACK_RESERVE_MIB");
+        const long mib = value ? strtol(value, nullptr, 10) : 6144;
+        return (size_t) std::max(1024L, mib) << 20;
+    }();
+    size_t free_bytes = 0, total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess ||
+        free_bytes < Bsz + SFBsz + min_free) {
+        cudaGetLastError();
+        if (!g_wc_headroom_warned) {
+            fprintf(stderr, "%s: preserving CUDA workspace (%zu MiB free, %zu MiB reserve); remaining tensors use MMQ\n",
+                          __func__, free_bytes >> 20, min_free >> 20);
+            g_wc_headroom_warned = true;
+        }
+        return g_wc.emplace(w_blocks, wc).first->second;
+    }
+    // Allocation can still race with another CUDA consumer. On OOM cache a null
+    // entry so this tensor uses MMQ without repeatedly attempting the allocation.
     if (cudaMalloc(&wc.dB, Bsz) != cudaSuccess) {
         cudaGetLastError(); // clear
         wc.dB = nullptr; wc.dSFB = nullptr;
