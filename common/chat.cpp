@@ -2369,7 +2369,10 @@ static void func_args_not_string(json & messages) {
                         try {
                             args = json::parse(args.get<std::string>());
                         } catch (const std::exception & e) {
-                            throw std::runtime_error("Failed to parse tool call arguments as JSON: " + std::string(e.what()));
+                            throw std::invalid_argument(
+                                "Tool call arguments contain invalid JSON, usually because generation was truncated at the "
+                                "context or output limit. Start a fresh conversation or retry with more context: " +
+                                std::string(e.what()));
                         }
                     }
                 }
