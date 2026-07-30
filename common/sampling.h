@@ -64,7 +64,11 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 //
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
 
-// same as common_sampler_sample but assumes the caller has already called llama_synchronize(ctx)
+// Same as common_sampler_sample but WITHOUT the internal llama_synchronize(ctx).
+// The caller MUST call llama_synchronize(ctx) once (on the main thread) before invoking this.
+// This allows sampling many sequences in parallel across threads: after a single pre-sync,
+// each call only reads its own logits row (idx) into the per-sampler cur_p and runs its own
+// (per-sampler) chain/grammar state, so concurrent calls on distinct gsmpl are race-free.
 llama_token common_sampler_sample_no_sync(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
 
 // generalized version of common_sampler_sample

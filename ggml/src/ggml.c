@@ -5439,6 +5439,24 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
+// fc-inference TRACK B: attach a paged-KV block table to flash_attn_ext.
+// bt is I32 [1 + max_pages, n_seq]: row 0 = seq KV length in cells, rows 1.. = page ids
+// (page p of seq s starts at cell bt[s][1+p]*FC_PAGE_SIZE in the unified K/V pool).
+void ggml_flash_attn_ext_add_block_table(
+        struct ggml_tensor * a,
+        struct ggml_tensor * bt) {
+    if (!bt) {
+        a->src[5] = NULL;
+        return;
+    }
+
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[5] == NULL);
+    GGML_ASSERT(bt->type == GGML_TYPE_I32);
+
+    a->src[5] = bt;
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(

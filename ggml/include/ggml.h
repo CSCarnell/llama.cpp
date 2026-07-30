@@ -2423,6 +2423,11 @@ extern "C" {
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);
 
+    // fc-inference TRACK B: paged-KV block table (I32 [1+max_pages, n_seq]) -> src[5]
+    GGML_API void ggml_flash_attn_ext_add_block_table(
+            struct ggml_tensor * a,
+            struct ggml_tensor * bt);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);

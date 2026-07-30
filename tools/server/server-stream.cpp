@@ -244,15 +244,18 @@ void stream_session_manager::start_gc() {
 }
 
 void stream_session_manager::stop_gc() {
-    bool was_running = running.exchange(false);
-    if (was_running) {
-        {
-            std::lock_guard<std::mutex> lock(gc_wake_mu);
-        }
-        gc_wake_cv.notify_all();
-        if (gc_thread.joinable()) {
-            gc_thread.join();
-        }
+    // Join must be gated on joinable(), NOT on was_running: if a signal-driven shutdown
+    // flips `running` false while the thread is still alive (or start_gc lost the race
+    // between exchange(true) and thread creation), skipping the join leaves a joinable
+    // std::thread to be destroyed -> std::terminate ("terminate called without an active
+    // exception") in ~stream_session_manager during __cxa_finalize. Observed on SIGTERM.
+    running.exchange(false);
+    {
+        std::lock_guard<std::mutex> lock(gc_wake_mu);
+    }
+    gc_wake_cv.notify_all();
+    if (gc_thread.joinable()) {
+        gc_thread.join();
     }
     // finalize all live sessions so no reader ever hangs
     std::vector<stream_session_ptr> snapshot;

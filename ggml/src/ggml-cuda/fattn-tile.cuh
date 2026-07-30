@@ -794,6 +794,9 @@ static __global__ void flash_attn_tile(
         const char * mask_ptr,
         const char * sinks_ptr,
         const int  * KV_max_ptr,
+        const int  * KV_min_ptr, // fc-inference: head-skip bound (unused by tile kernel, kept for signature parity)
+        const int32_t * BT_ptr,  // fc-inference TRACK B: unused by tile kernel (signature parity)
+        const int32_t   bt_nr,
         float      * dst_ptr,
         float2     * dst_meta_ptr,
         const float scale,
@@ -809,6 +812,7 @@ static __global__ void flash_attn_tile(
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int32_t nb32, const int64_t nb33) {
+    GGML_UNUSED(KV_min_ptr); GGML_UNUSED(BT_ptr); GGML_UNUSED(bt_nr); // fc-inference: tile kernel does not head-skip or page-gather
 #ifdef FLASH_ATTN_AVAILABLE
     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
     const char * GGML_CUDA_RESTRICT K        = K_ptr;

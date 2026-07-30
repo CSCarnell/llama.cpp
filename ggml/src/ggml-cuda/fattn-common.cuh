@@ -25,6 +25,9 @@ typedef void (* fattn_kernel_t)(
         const char * __restrict__ mask,
         const char * __restrict__ sinks,
         const int  * __restrict__ KV_max,
+        const int  * __restrict__ KV_min,
+        const int32_t * __restrict__ BT, // fc-inference TRACK B: paged block table (cols = [len, page...]) or nullptr
+        const int32_t             bt_nr, // rows per BT column = 1 + max_pages
         float      * __restrict__ dst,
         float2     * __restrict__ dst_meta,
         const float scale,
@@ -661,10 +664,16 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
     }
 }
 
+// fc-inference: scans the attention mask to determine, per (sequence, query-tile), BOTH the
+// highest non-masked KV block (KV_max, tail-skip) and the LOWEST non-masked KV block (KV_min,
+// head-skip). Together they bound each query tile to a [KV_min, KV_max) window instead of the
+// full shared KV pool. This is what makes unified-KV (paged) attention only process the tokens
+// actually used by each sequence, symmetric to how split-KV bounds each stream.
 template <int ncols1>
 __launch_bounds__(FATTN_KQ_STRIDE/2, 1)
 static __global__ void flash_attn_mask_to_KV_max(
-        const half2 * __restrict__ mask, int * __restrict__ KV_max, const int ne30, const int s31, const int s33) {
+        const half2 * __restrict__ mask, int * __restrict__ KV_max, int * __restrict__ KV_min,
+        const int ne30, const int s31, const int s33) {
     const int ne31     = gridDim.x;
     const int tid      = threadIdx.x;
     const int sequence = blockIdx.y;
@@ -673,6 +682,8 @@ static __global__ void flash_attn_mask_to_KV_max(
     mask += sequence*s33 + jt*ncols1*s31;
 
     __shared__ int buf_iw[WARP_SIZE];
+
+    // ---- KV_max: scan downward for the highest non-masked FATTN_KQ_STRIDE block ----
     if (tid < WARP_SIZE) {
         buf_iw[tid] = 1;
     }
@@ -708,11 +719,48 @@ static __global__ void flash_attn_mask_to_KV_max(
     // In either case, walk back the decrementation by FATTN_KQ_STRIDE.
     KV_max_sj += FATTN_KQ_STRIDE;
 
+    // ---- KV_min: scan upward for the lowest non-masked FATTN_KQ_STRIDE block ----
+    __syncthreads();
+    if (tid < WARP_SIZE) {
+        buf_iw[tid] = 1;
+    }
+    __syncthreads();
+
+    int KV_min_sj = 0;
+    for (; KV_min_sj < ne30 * FATTN_KQ_STRIDE; KV_min_sj += FATTN_KQ_STRIDE) {
+        int all_inf = 1;
+
+#pragma unroll
+        for (int j = 0; j < ncols1; ++j) {
+            const float2 tmp = __half22float2(mask[j*s31 + KV_min_sj/2 + tid]);
+            all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
+        }
+
+        all_inf = warp_reduce_all(all_inf);
+        if (tid % WARP_SIZE == 0) {
+            buf_iw[tid / WARP_SIZE] = all_inf;
+        }
+        __syncthreads();
+        all_inf = buf_iw[tid % WARP_SIZE];
+        __syncthreads();
+        all_inf = warp_reduce_all(all_inf);
+
+        if (!all_inf) {
+            break;
+        }
+    }
+    // KV_min_sj is now the lower edge of the first non-masked tile. If the whole row is masked
+    // it ends at ne30*FATTN_KQ_STRIDE; clamp to 0 (harmless: KV_max will be 0 and no work runs).
+    if (KV_min_sj >= ne30 * FATTN_KQ_STRIDE) {
+        KV_min_sj = 0;
+    }
+
     if (threadIdx.x != 0) {
         return;
     }
 
     KV_max[sequence*ne31 + jt] = KV_max_sj;
+    KV_min[sequence*ne31 + jt] = KV_min_sj;
 }
 
 template<int D, int ncols1, int ncols2> // D == head size
@@ -981,6 +1029,7 @@ void launch_fattn(
 
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * bt    = dst->src[5]; // fc-inference TRACK B: paged block table (I32 [1+max_pages, n_tokens])
 
     ggml_tensor * KQV = dst;
 
@@ -1003,6 +1052,7 @@ void launch_fattn(
         ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
 
     ggml_cuda_pool_alloc<int>    KV_max(pool);
+    ggml_cuda_pool_alloc<int>    KV_min(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
 
@@ -1088,7 +1138,13 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+    // fc-inference: also enable the mask scan for unified-KV batched decode/prefill (multiple
+    // sequences packed into a single stream => Q->ne[3]==1 but Q->ne[1]>1 with a mask). Without
+    // this, unified-KV attention iterates the FULL shared KV pool for every query. The scan
+    // (KV_max tail-skip, and KV_min head-skip below) bounds each query tile to its own range.
+    // (bt: the scan stays enabled — MMA prefill under paged placement relies on it; the vec
+    //  gather kernel ignores KV_min/KV_max when BT is present, so it is merely redundant there)
+    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || Q->ne[1] > 1)) {
         const int s31 = mask->nb[1] / sizeof(half2);
         const int s33 = mask->nb[3] / sizeof(half2);
 
@@ -1099,9 +1155,35 @@ void launch_fattn(
         const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;
 
         KV_max.alloc(ne_KV_max);
+        KV_min.alloc(ne_KV_max);
         flash_attn_mask_to_KV_max<ncols1><<<blocks_num_KV_max, block_dim_KV_max, 0, main_stream>>>
-            ((const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
+            ((const half2 *) mask->data, KV_max.ptr, KV_min.ptr, iter_k, s31, s33);
         CUDA_CHECK(cudaGetLastError());
+
+        // fc-inference: one-shot diagnostic. Dump per-tile [KV_min,KV_max) spans so we can see
+        // whether the head/tail skip actually bounds each decode tile tightly or degenerates to
+        // the full pool (per-tile union over sequences). Enable with FC_FA_DEBUG=1.
+        static int fc_fa_dbg_calls = 0;
+        if (getenv("FC_FA_DEBUG") && fc_fa_dbg_calls < 40 && Q->ne[1] >= 16 && Q->ne[1] <= 128) {
+            std::vector<int> h_max(ne_KV_max), h_min(ne_KV_max);
+            CUDA_CHECK(cudaStreamSynchronize(main_stream));
+            CUDA_CHECK(cudaMemcpy(h_max.data(), KV_max.ptr, ne_KV_max*sizeof(int), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(h_min.data(), KV_min.ptr, ne_KV_max*sizeof(int), cudaMemcpyDeviceToHost));
+            long span_sum = 0, min_sum = 0, max_sum = 0; int span_max = 0, span_min = 1<<30;
+            for (int i = 0; i < ne_KV_max; ++i) {
+                const int sp = h_max[i] - h_min[i];
+                span_sum += sp; span_max = std::max(span_max, sp); span_min = std::min(span_min, sp);
+                min_sum += h_min[i]; max_sum += h_max[i];
+            }
+            const int n = std::max(1, ne_KV_max);
+            // span=avg scanned cells/tile. If span<<n_kv -> bounds tight; span~=n_kv -> full-pool scan.
+            fprintf(stderr, "[FC_FA_DEBUG] call=%d ncols1=%d Q->ne[1]=%d ntiles=%d n_kv(pool)=%d "
+                            "KVmin(avg)=%ld KVmax(avg)=%ld span[min/avg/max]=%d/%ld/%d  scanned/pool=%.2f\n",
+                    fc_fa_dbg_calls, ncols1, (int)Q->ne[1], ne_KV_max, (int)K->ne[1],
+                    min_sum/n, max_sum/n, span_min, span_sum/n, span_max,
+                    (double)(span_sum/n)/std::max(1,(int)K->ne[1]));
+            fc_fa_dbg_calls++;
+        }
     }
 
     const dim3 block_dim(warp_size, nwarps, 1);
@@ -1211,6 +1293,9 @@ void launch_fattn(
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
+        KV_min.ptr,
+        bt ? (const int32_t *) bt->data : nullptr,
+        bt ? (int32_t) bt->ne[0] : 0,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],

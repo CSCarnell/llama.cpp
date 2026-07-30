@@ -26,8 +26,10 @@
 #include <utility>
 #include <fstream>
 #include <thread>
+#include <atomic>
 #include <mutex>
 #include <condition_variable>
+#include <functional>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -3001,6 +3003,78 @@ private:
         async_pending_for_worker.clear();
     }
 
+    // ── Persistent worker pool for parallel per-slot sampling ──────────────
+    // Sampling is CPU-bound and embarrassingly parallel across slots, but must
+    // NOT spawn threads per step (thread-create churn at ~12 steps/s interferes
+    // with the decode-submit thread and the async-output worker, inflating
+    // decode time). This pool spins up N workers ONCE; run() wakes them via a
+    // generation counter and the calling (main) thread participates as well.
+    struct sampling_pool {
+        std::vector<std::thread>    workers;
+        std::mutex                  mtx;
+        std::condition_variable     cv_start;
+        std::condition_variable     cv_done;
+        std::function<void(size_t)> fn;
+        size_t                      n_items   = 0;
+        std::atomic<size_t>         next{0};
+        size_t                      remaining = 0;
+        uint64_t                    gen       = 0;
+        bool                        stop      = false;
+
+        ~sampling_pool() {
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                stop = true;
+                gen++;
+            }
+            cv_start.notify_all();
+            for (auto & w : workers) if (w.joinable()) w.join();
+        }
+
+        void ensure(int nworkers) {
+            if (!workers.empty() || nworkers <= 0) return;
+            for (int i = 0; i < nworkers; ++i) {
+                workers.emplace_back([this]() {
+                    uint64_t seen = 0;
+                    for (;;) {
+                        std::unique_lock<std::mutex> lk(mtx);
+                        cv_start.wait(lk, [&]{ return stop || gen != seen; });
+                        if (stop) return;
+                        seen = gen;
+                        lk.unlock();
+                        size_t k;
+                        while ((k = next.fetch_add(1, std::memory_order_relaxed)) < n_items) fn(k);
+                        lk.lock();
+                        if (--remaining == 0) cv_done.notify_one();
+                    }
+                });
+            }
+        }
+
+        // Execute f over [0, items). The calling thread participates in the work.
+        void run(size_t items, const std::function<void(size_t)> & f) {
+            if (workers.empty()) { // serial fallback
+                for (size_t k = 0; k < items; ++k) f(k);
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                fn        = f;
+                n_items   = items;
+                next.store(0, std::memory_order_relaxed);
+                remaining = workers.size();
+                gen++;
+            }
+            cv_start.notify_all();
+            size_t k;
+            while ((k = next.fetch_add(1, std::memory_order_relaxed)) < n_items) fn(k);
+            std::unique_lock<std::mutex> lk(mtx);
+            cv_done.wait(lk, [&]{ return remaining == 0; });
+        }
+    };
+    sampling_pool m_sampling_pool;
+
+
     // @ngxson : for debugging only
     int64_t t_pre_decode  = 0;
     int64_t t_decode      = 0;
@@ -3010,7 +3084,7 @@ private:
     int64_t n_decode      = 0;
     int64_t n_post_decode = 0;
     int64_t n_sampl       = 0;
-// #define DEBUG_TIMINGS
+#define DEBUG_TIMINGS
 #ifdef DEBUG_TIMINGS
     struct scoped_timer {
         int64_t & t;
@@ -3357,8 +3431,48 @@ private:
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
+        // NOTE: prefill/decode phase separation (FCSCHED_PHASE cadence gate) was tried
+        // here and MEASURED to NOT help (8.5-8.9k vs 8.9k baseline, slightly worse) —
+        // decode batches are already full (avg 93.5/96) so deferring prefill did not
+        // create a faster pure-decode pass. The real gap is per-forward-pass MoE kernel
+        // efficiency vs vLLM (~16-20x on GB10, same harness), not scheduling. Reverted.
+        // [FC_GATE] prefill accumulation gate: admit pending prompts into the batch
+        // only when enough have accumulated (or a deadline passes), so prefill runs in
+        // FEW, LARGE passes at the CUTLASS big-batch rate (~30k t/s) instead of riding
+        // every pass as small ~750-token chunks at ~10k t/s marginal. FCLAT measured the
+        // dribble: 78% of GPU time in 99.8ms mixed passes that each advance only ~95
+        // decode tokens. Gating keeps most passes pure-decode (24.7ms) and batches
+        // prompt work. FC_GATE_SLOTS=<n> enables (admit when >= n slots have pending
+        // prompts), FC_GATE_MS caps added latency (default 200ms). Safety: admit
+        // immediately when nothing is generating (no decode work to overlap with).
+        static const int fc_gate_slots = []{ const char * e = getenv("FC_GATE_SLOTS"); return e ? atoi(e) : 0; }();
+        static const int fc_gate_ms    = []{ const char * e = getenv("FC_GATE_MS");    return e ? atoi(e) : 200; }();
+        bool fc_admit_prompts = true;
+        if (fc_gate_slots > 0) {
+            int n_pending = 0;
+            int n_gen     = 0;
+            for (const auto & s : slots) {
+                if (s.state == SLOT_STATE_PROCESSING_PROMPT || s.state == SLOT_STATE_STARTED) {
+                    n_pending++;
+                } else if (s.state == SLOT_STATE_GENERATING) {
+                    n_gen++;
+                }
+            }
+            static int64_t t_first_pending = 0;
+            if (n_pending == 0) {
+                t_first_pending = 0;
+            } else if (t_first_pending == 0) {
+                t_first_pending = ggml_time_us();
+            }
+            const bool deadline = t_first_pending != 0 && (ggml_time_us() - t_first_pending) / 1000 >= fc_gate_ms;
+            fc_admit_prompts = n_pending >= fc_gate_slots || deadline || n_gen == 0;
+            if (fc_admit_prompts) {
+                t_first_pending = 0;
+            }
+        }
+
         // next, batch any pending prompts without exceeding n_batch
-        if (params_base.cont_batching || batch.size() == 0) {
+        if ((params_base.cont_batching || batch.size() == 0) && fc_admit_prompts) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
             iterate(slots, [&](server_slot & slot) {
@@ -3916,7 +4030,58 @@ private:
             n_empty_consecutive = 0;
         }
 
+        // [FCSCHED] batch-composition probe: avg total tokens per llama_decode
+        // vs avg output(=decode/generation)-flagged tokens. Tells us whether the
+        // effective decode batch is full (~96) or fragmented by prefill churn.
+        if (getenv("FCSCHED_DEBUG")) {
+            static uint64_t nc = 0, sum_out = 0, sum_tot = 0, hist_out[8] = {0};
+            int n_out = 0;
+            for (int i = 0; i < batch_view.n_tokens; i++) {
+                if (batch_view.logits && batch_view.logits[i]) n_out++;
+            }
+            sum_out += n_out; sum_tot += batch_view.n_tokens; nc++;
+            int b = n_out == 0 ? 0 : n_out <= 8 ? 1 : n_out <= 16 ? 2 : n_out <= 32 ? 3 :
+                    n_out <= 48 ? 4 : n_out <= 64 ? 5 : n_out <= 96 ? 6 : 7;
+            hist_out[b]++;
+            if (nc % 40 == 0) {
+                fprintf(stderr, "[FCSCHED] calls=%llu avg_batch=%.1f avg_decode=%.1f  out-hist [0]=%llu [1-8]=%llu [9-16]=%llu [17-32]=%llu [33-48]=%llu [49-64]=%llu [65-96]=%llu [97+]=%llu\n",
+                    (unsigned long long)nc, (double)sum_tot/nc, (double)sum_out/nc,
+                    (unsigned long long)hist_out[0], (unsigned long long)hist_out[1], (unsigned long long)hist_out[2], (unsigned long long)hist_out[3],
+                    (unsigned long long)hist_out[4], (unsigned long long)hist_out[5], (unsigned long long)hist_out[6], (unsigned long long)hist_out[7]);
+                fflush(stderr);
+            }
+        }
+
+        // [FCLAT] pass-latency by composition (FCSCHED_DEBUG only):
+        // dec = pure decode (every token outputs), pre = pure prefill (<=1 output), mix = both.
+        static const bool fclat_on = getenv("FCSCHED_DEBUG") != nullptr;
+        int64_t fclat_t0 = 0;
+        int     fclat_comp = -1;
+        if (fclat_on) {
+            int n_out = 0;
+            for (int i = 0; i < batch_view.n_tokens; i++) {
+                if (batch_view.logits && batch_view.logits[i]) n_out++;
+            }
+            fclat_comp = (n_out >= batch_view.n_tokens) ? 0 : (n_out <= 1 ? 2 : 1);
+            fclat_t0 = ggml_time_us();
+        }
+
         const int ret = llama_decode(ctx_tgt, batch_view);
+
+        if (fclat_on && fclat_comp >= 0) {
+            static uint64_t lat_us[3] = {0}, lat_n[3] = {0}, lat_tok[3] = {0};
+            static uint64_t ncall = 0;
+            lat_us[fclat_comp] += (uint64_t)(ggml_time_us() - fclat_t0);
+            lat_n[fclat_comp]++;
+            lat_tok[fclat_comp] += batch_view.n_tokens;
+            if (++ncall % 40 == 0) {
+                fprintf(stderr, "[FCLAT] dec: n=%llu avg=%.1fms tok=%.0f | mix: n=%llu avg=%.1fms tok=%.0f | pre: n=%llu avg=%.1fms tok=%.0f\n",
+                    (unsigned long long)lat_n[0], lat_n[0] ? lat_us[0]/1000.0/lat_n[0] : 0.0, lat_n[0] ? (double)lat_tok[0]/lat_n[0] : 0.0,
+                    (unsigned long long)lat_n[1], lat_n[1] ? lat_us[1]/1000.0/lat_n[1] : 0.0, lat_n[1] ? (double)lat_tok[1]/lat_n[1] : 0.0,
+                    (unsigned long long)lat_n[2], lat_n[2] ? lat_us[2]/1000.0/lat_n[2] : 0.0, lat_n[2] ? (double)lat_tok[2]/lat_n[2] : 0.0);
+                fflush(stderr);
+            }
+        }
 
         metrics.on_decoded(slots);
 
@@ -4028,6 +4193,21 @@ private:
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
 
+        // ── Parallel sampling ──────────────────────────────────────────────
+        // At high concurrency, per-slot sampling dominates post-decode: each
+        // common_sampler_sample builds a full-vocab candidate array (~152k for
+        // Qwen3) and runs the sampler chain — ~0.31 ms/slot, i.e. ~30 ms/step
+        // for 96 slots, all serial on the main thread and fully additive to
+        // decode. It is embarrassingly parallel: each slot has its own sampler
+        // state and reads its own logits row, so after a single main-thread
+        // llama_synchronize() the per-slot samples run concurrently.
+        //   Pass 0 (serial):   pre-sampling slot state handling; collect slots.
+        //   Pass 1 (parallel): the expensive common_sampler_sample_no_sync.
+        //   Pass 2 (serial):   accept + result construction + defer/process.
+        struct samp_item { server_slot * slot; int tok_idx; };
+        std::vector<samp_item> samp_items;
+        samp_items.reserve(slots.size());
+
         iterate(slots, [&](server_slot & slot) {
             // optionally send prompt processing progress
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
@@ -4073,20 +4253,53 @@ private:
                 return; // sample using speculative decoding
             }
 
-            // shifted according to the current sub-batch
-            const int tok_idx = slot.i_batch - off;
+            // shifted according to the current sub-batch; sampled in Pass 1
+            samp_items.push_back({ &slot, slot.i_batch - off });
+        });
 
-            llama_token id;
-            {
-                scoped_timer timer(t_sampl, n_sampl);
-                id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
-            }
+        // Pass 1: parallel sampling. Pre-synchronize the shared context ONCE on
+        // the main thread so the per-slot _no_sync calls never touch the
+        // (non-thread-safe) llama_context::synchronize() bookkeeping.
+        std::vector<llama_token> samp_ids(samp_items.size(), LLAMA_TOKEN_NULL);
+        if (!samp_items.empty()) {
+            // GPU decode-completion wait: keep it OUT of t_sampl so t_sampl
+            // reflects pure CPU sampling time. This single main-thread sync lets
+            // the per-slot _no_sync calls run concurrently without touching the
+            // (non-thread-safe) llama_context::synchronize() bookkeeping.
+            llama_synchronize(ctx_tgt);
+
+            static const int n_sample_threads = []() {
+                const char * e = getenv("FC_SAMPLE_THREADS");
+                int v = e ? atoi(e) : 8;
+                return v < 1 ? 1 : v;
+            }();
+            // persistent pool: n_sample_threads total workers incl. main thread
+            m_sampling_pool.ensure(n_sample_threads - 1);
+
+            auto sample_one = [&](size_t k) {
+                try {
+                    samp_ids[k] = common_sampler_sample_no_sync(
+                        samp_items[k].slot->smpl.get(), ctx_tgt, samp_items[k].tok_idx);
+                } catch (const std::exception &) {}
+            };
+
+            scoped_timer timer(t_sampl, n_sampl); // per-step wall time of parallel sampling
+            m_sampling_pool.run(samp_items.size(), sample_one);
+        }
+
+        // Pass 2: accept sampled tokens and process results (serial: touches
+        // shared server state, streaming and slot lifecycle). The context was
+        // synchronized in Pass 1, so per-step time measurement is valid here.
+        for (size_t k = 0; k < samp_items.size(); ++k) {
+          try {
+            server_slot & slot    = *samp_items[k].slot;
+            const int     tok_idx = samp_items[k].tok_idx;
+            const llama_token id   = samp_ids[k];
 
             slot.i_batch = -1;
 
             common_sampler_accept(slot.smpl.get(), id, true);
 
-            // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
             const int64_t t_now = ggml_time_us();
 
             slot.n_decoded += 1;
@@ -4118,13 +4331,9 @@ private:
             if (defer_jobs) {
                 // async output processing: the main thread owns slot.sampled (used
                 // to build the next batch), so set it here. EVERYTHING ELSE —
-                // detokenization (common_token_to_piece), text accumulation,
-                // stop-string matching and the streaming response — is deferred to
-                // the worker thread and runs concurrently with the next
-                // llama_decode(). Detok reads only the immutable vocab (never the
-                // logits/KV), so it is safe off the main thread; moving it here is
-                // what actually fills the GPU bubble (post_decode was ~14 ms/step,
-                // dominated by detok, while decode is ~20 ms).
+                // detokenization, text accumulation, stop-string matching and the
+                // streaming response — is deferred to the worker thread and runs
+                // concurrently with the next llama_decode().
                 slot.sampled = result.tok;
                 async_output_job job;
                 job.slot            = &slot;
@@ -4133,7 +4342,7 @@ private:
                 job.accept_special  = special;                // snapshot for deferred detok
                 job.result          = std::move(result);
                 defer_jobs->push_back(std::move(job));
-                return;
+                continue;
             }
 
             // synchronous path: detokenize inline before processing
@@ -4145,12 +4354,12 @@ private:
                 send_final_response(slot);
                 metrics.on_prediction(slot);
                 slot.release();
-
-                return;
+                continue;
             }
 
             slot.print_timings_tg();
-        });
+          } catch (const std::exception &) {}
+        }
 
         // speculative decoding - main model sample and accept
         iterate(slots, [&](server_slot & slot) {

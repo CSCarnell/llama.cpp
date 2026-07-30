@@ -377,12 +377,95 @@ llama_kv_cache::llama_kv_cache(
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+
+    // fc-inference: contiguous per-sequence allocation (unified pool only).
+    if (getenv("FC_CONTIG_KV") && n_stream == 1) {
+        fc_contig = true;
+        const char * r = getenv("FC_CONTIG_RESERVE");
+        if (r) {
+            fc_reserve = (uint32_t) atoi(r);
+        }
+        // [FC_CONTIG_STRIDE] ordered placement: seq s owns fixed home [s*stride,(s+1)*stride).
+        // If unset, auto-size to kv_size/n_seq so the pool exactly fills the allocated context
+        // (no inflation) and each seq gets an equal, KV-ordered home. stride MUST cover the
+        // longest sequence (prompt+gen); overflow corrupts the next seq's home.
+        const char * st = getenv("FC_CONTIG_STRIDE");
+        if (st) {
+            fc_stride = (uint32_t) atoi(st);
+            if (fc_stride && kv_size / fc_stride < 1) fc_stride = 0;
+        }
+        fc_reserve_owner.assign(kv_size, -1);
+        fc_seq_tail.assign(LLAMA_MAX_SEQ, -1);
+        fc_seq_end.assign(LLAMA_MAX_SEQ, -1);
+        LLAMA_LOG_INFO("%s: fc-inference contiguous KV allocation ENABLED (reserve=%u cells/seq, ordered stride=%u)\n",
+                __func__, fc_reserve, fc_stride);
+    }
+
+    // fc-inference: FC_USTREAM=<stride_cells> enables exact-arena placement + mask-free per-stream
+    // attention views over the UNIFIED pool (unified n_stream==1 only). seq s owns fixed arena
+    // [s*stride, (s+1)*stride). stride MUST cover the longest sequence (prompt+gen). A single
+    // sequence can still occupy nseq=1 view up to the whole pool => no context split.
+    if (getenv("FC_USTREAM") && n_stream == 1) {
+        const uint32_t st = (uint32_t) atoi(getenv("FC_USTREAM"));
+        if (st >= 256 && st <= kv_size) {
+            fc_ustream        = true;
+            fc_ustream_stride = st;
+            // ustream reuses the fc_contig bookkeeping arrays for arena ownership.
+            if (fc_reserve_owner.empty()) fc_reserve_owner.assign(kv_size, -1);
+            if (fc_seq_tail.empty())      fc_seq_tail.assign(LLAMA_MAX_SEQ, -1);
+            if (fc_seq_end.empty())       fc_seq_end.assign(LLAMA_MAX_SEQ, -1);
+            fprintf(stderr, "[FC_USTREAM] per-stream views ENABLED (stride=%u cells, kv_size=%u, max seqs=%u)\n",
+                    fc_ustream_stride, (uint32_t) kv_size, (uint32_t)(kv_size / fc_ustream_stride));
+        } else {
+            LLAMA_LOG_ERROR("%s: FC_USTREAM=%u invalid (need 256..kv_size=%u) - DISABLED\n", __func__, st, kv_size);
+        }
+    }
+
+    // fc-inference TRACK B: FC_PAGED=1 true paged KV allocation (unified pool only).
+    // Mutually exclusive with FC_USTREAM/FC_CONTIG_KV (different placement disciplines).
+    if (getenv("FC_PAGED") && n_stream == 1 && !fc_ustream && !fc_contig) {
+        if (kv_size % FC_PAGE_SIZE != 0) {
+            LLAMA_LOG_ERROR("%s: FC_PAGED requires kv_size %% %u == 0 (kv_size=%u) - DISABLED\n",
+                    __func__, FC_PAGE_SIZE, kv_size);
+        } else {
+            fc_paged = true;
+            const uint32_t n_pages = kv_size / FC_PAGE_SIZE;
+            fc_pages_of_seq.assign(LLAMA_MAX_SEQ, {});
+            fc_seq_len.assign(LLAMA_MAX_SEQ, 0);
+            fc_page_owner.assign(n_pages, -1);
+            fc_free_pages.clear();
+            fc_free_pages.reserve(n_pages);
+            for (uint32_t p = n_pages; p > 0; --p) {
+                fc_free_pages.push_back(p - 1); // pop order: page 0 first (cosmetic)
+            }
+            fprintf(stderr, "[FC_PAGED] paged KV allocation ENABLED (page=%u cells, pages=%u, kv_size=%u, seqs<=%u)\n",
+                    FC_PAGE_SIZE, n_pages, kv_size, n_seq_max);
+        }
+    }
 }
 
 void llama_kv_cache::clear(bool data) {
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
+    }
+
+    if (fc_contig) {
+        std::fill(fc_reserve_owner.begin(), fc_reserve_owner.end(), -1);
+        std::fill(fc_seq_tail.begin(),      fc_seq_tail.end(),      -1);
+        std::fill(fc_seq_end.begin(),       fc_seq_end.end(),       -1);
+    }
+
+    if (fc_paged) {
+        // full reset: all pages back to the free list
+        const uint32_t n_pages = (uint32_t) fc_page_owner.size();
+        for (auto & pl : fc_pages_of_seq) pl.clear();
+        std::fill(fc_seq_len.begin(), fc_seq_len.end(), 0);
+        std::fill(fc_page_owner.begin(), fc_page_owner.end(), -1);
+        fc_free_pages.clear();
+        for (uint32_t p = n_pages; p > 0; --p) {
+            fc_free_pages.push_back(p - 1);
+        }
     }
 
     if (data) {
@@ -455,6 +538,31 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                 head = new_head;
             }
         }
+    }
+
+    // fc-inference: authoritative free point for contiguous reservations. Cells here reflect reality
+    // (removal already applied), unlike during find_slot planning, so liveness can be judged safely.
+    if (fc_contig) {
+        auto & cells = v_cells[0];
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            // only reclaim reservations whose owner sequence is now fully gone — never touch a live
+            // sequence's empty decode-gap cells (that would re-scatter it on the next append)
+            const int32_t o = fc_reserve_owner[i];
+            if (o >= 0 && cells.is_empty(i) && cells.seq_pos_min(o) < 0) {
+                fc_reserve_owner[i] = -1;
+            }
+        }
+        for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            if (fc_seq_tail[s] >= 0 && cells.seq_pos_min(s) < 0) {
+                fc_seq_tail[s] = -1;
+                fc_seq_end[s]  = -1;
+            }
+        }
+    }
+
+    // fc-inference TRACK B: reclaim dead sequences' pages (authoritative point, cells reflect removal)
+    if (fc_paged) {
+        fc_paged_reclaim();
     }
 
     return true;
@@ -907,6 +1015,49 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
     return updated;
 }
 
+// fc-inference TRACK B: return a dead sequence's pages to the free list. Called from seq_rm/clear
+// AFTER cell state reflects the removal (authoritative liveness). A page is only freed when ALL of
+// its cells are empty — seq_cp may have given other seqs references into this page's cells, in which
+// case the page is orphaned (owner=-2) and re-swept on subsequent reclaims until it drains.
+void llama_kv_cache::fc_paged_reclaim() const {
+    const auto & cells = v_cells[0];
+    constexpr uint32_t PAGE = FC_PAGE_SIZE;
+
+    auto page_empty = [&](uint32_t pg) {
+        const uint32_t c0 = pg*PAGE;
+        for (uint32_t c = c0; c < c0 + PAGE; ++c) {
+            if (!cells.is_empty(c)) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+        if (fc_pages_of_seq[s].empty() || cells.seq_pos_min(s) >= 0) {
+            continue; // no pages, or seq still alive
+        }
+        for (const uint32_t pg : fc_pages_of_seq[s]) {
+            if (page_empty(pg)) {
+                fc_page_owner[pg] = -1;
+                fc_free_pages.push_back(pg);
+            } else {
+                fc_page_owner[pg] = -2; // orphan: drained later
+            }
+        }
+        fc_pages_of_seq[s].clear();
+        fc_seq_len[s] = 0;
+    }
+
+    // orphan sweep
+    for (uint32_t pg = 0; pg < fc_page_owner.size(); ++pg) {
+        if (fc_page_owner[pg] == -2 && page_empty(pg)) {
+            fc_page_owner[pg] = -1;
+            fc_free_pages.push_back(pg);
+        }
+    }
+}
+
 llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont) const {
 
     if (debug > 0) {
@@ -994,6 +1145,227 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
     res.resize(n_seqs);
 
+    // fc-inference: contiguous per-sequence allocation (unified pool). Place each token into its
+    // sequence's own contiguous reserved run so a sequence's cells cluster together instead of
+    // scattering across the pool. Everything downstream (positions, mask, attention) derives from
+    // apply_ubatch(cell -> pos/seq), so correctness is preserved; contiguity is purely a layout win.
+    // fc-inference: FC_USTREAM exact-arena placement. seq s token at position p -> cell s*stride+p.
+    // Regular placement is REQUIRED so get_k_ustream can present a strided ggml_view_4d per stream.
+    // Placement is unconditional (independent of the attention path); if the ubatch later fails the
+    // ustream attention gate it still decodes correctly via the unified-masked fallback.
+    if (fc_ustream) { // implies n_stream == 1
+        auto & cells = v_cells[0];
+        const uint32_t sz     = cells.size();
+        const uint32_t stride = fc_ustream_stride;
+
+        res.s0 = 0;
+        res.s1 = 0;
+        res.strm[0] = 0;
+        res.idxs[0].clear();
+        res.idxs[0].reserve(n_tokens);
+
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            const llama_seq_id seq = ubatch.seq_id[i][0];
+            const llama_pos    pos = ubatch.pos[i];
+            if (pos < 0 || (uint32_t) pos >= stride) {
+                return {}; // sequence exceeded its arena -> fail (caller falls back / errors)
+            }
+            const uint64_t cell = (uint64_t) seq * stride + (uint32_t) pos;
+            if (cell >= sz) {
+                return {}; // arena beyond pool -> fail
+            }
+            res.idxs[0].push_back((uint32_t) cell);
+        }
+        return res;
+    }
+
+    // fc-inference TRACK B: FC_PAGED placement. Cell of (seq s, pos p) = pages_of_seq[s][p/PAGE]*PAGE + p%PAGE.
+    // Pages are allocated lazily from the free list the first time a seq reaches a new page index and are
+    // NOT returned until the seq fully dies (seq_rm/clear) => the (seq,pos)->cell mapping is a stable,
+    // idempotent function across speculative find_slot calls (prepare() rollback needs no page rollback).
+    // No per-seq cap: one seq may consume every page (P1 unbounded). Pool exhaustion -> return {} (caller
+    // defers/fails the ubatch). Phase 1 runs on the unified MASKED attention path: scattered cells are
+    // already handled correctly by the mask, so this is correct-before-fast.
+    if (fc_paged) { // implies n_stream == 1
+        auto & cells = v_cells[0];
+        const uint32_t sz = cells.size();
+        constexpr uint32_t PAGE = FC_PAGE_SIZE;
+
+        res.s0 = 0;
+        res.s1 = 0;
+        res.strm[0] = 0;
+        res.idxs[0].clear();
+        res.idxs[0].reserve(n_tokens);
+
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            const llama_seq_id seq = ubatch.seq_id[i][0];
+            const llama_pos    pos = ubatch.pos[i];
+            if (pos < 0 || seq < 0 || seq >= LLAMA_MAX_SEQ) {
+                return {};
+            }
+            const uint32_t pidx  = (uint32_t) pos / PAGE;
+            auto & pages = fc_pages_of_seq[seq];
+            while (pidx >= pages.size()) {
+                if (fc_free_pages.empty()) {
+                    return {}; // pool exhausted; mapping already made stays valid (stable mapping)
+                }
+                const uint32_t pg = fc_free_pages.back();
+                fc_free_pages.pop_back();
+                fc_page_owner[pg] = seq;
+                pages.push_back(pg);
+            }
+            const uint32_t cell = pages[pidx]*PAGE + ((uint32_t) pos % PAGE);
+            if (cell >= sz) {
+                return {};
+            }
+            res.idxs[0].push_back(cell);
+            if ((uint32_t) pos + 1 > fc_seq_len[seq]) {
+                fc_seq_len[seq] = (uint32_t) pos + 1;
+            }
+        }
+        return res;
+    }
+
+    if (fc_contig) { // implies n_stream == 1, n_seqs == 1
+        auto & cells = v_cells[0];
+        const uint32_t sz = cells.size();
+
+        res.s0 = 0;
+        res.s1 = 0;
+        res.strm[0] = 0;
+        res.idxs[0].clear();
+        res.idxs[0].reserve(n_tokens);
+
+        // Find a contiguous run of `need` cells that are empty and free (owner < 0 or already this seq).
+        // NOTE: during find_slot the current ubatch's cells are NOT yet applied, so cell emptiness is
+        // NOT a reliable liveness signal here. Reservations are freed authoritatively in seq_rm/clear,
+        // so any owner>=0 belongs to a live sequence (or one being placed in this same ubatch) and must
+        // be respected to prevent two sequences overlapping.
+        // COLLISION-SAFE: a fresh/overflow run must come from TRULY-UNOWNED cells only
+        // (owner < 0). We must NOT accept owner==seq cells here: during find_slot the current
+        // ubatch is not yet applied, so is_empty() is true for cells THIS seq is about to write.
+        // Accepting owner==seq would let an in-ubatch overflow re-find the seq's own just-planned
+        // home cells (empty during planning) and return base=0, overwriting tokens it just placed
+        // -> runaway garbage under concurrent long docs. Unowned-only makes the free-list authoritative.
+        // [VARIABLE-LENGTH SEQ-ORDERED PACKING] Find a contiguous run of `need` truly-unowned
+        // (owner < 0) empty cells, scanning UPWARD from `hint` first, then wrapping to [0,hint).
+        // The hint = seq * fc_stride biases each sequence's run to a seq-PROPORTIONAL position, so
+        // regardless of the temporal order sequences are placed in, their cells land in seq_id
+        // order across the pool. Combined with sizing `need` to the sequence's ACTUAL prompt+gen
+        // (variable length, not a fixed arena), this keeps co-active sequences KV-adjacent AND
+        // tightly packed (no oversized gaps, no tail-scatter) -> FlashAttention's 8-wide MMA tiles
+        // cover a narrow [KV_min,KV_max] span so the head/tail skip fires on every tile.
+        auto find_run_hint = [&](uint32_t need, uint32_t hint) -> int32_t {
+            if (hint >= sz) hint = 0;
+            uint32_t run = 0, start = 0;
+            for (uint32_t c = hint; c < sz; ++c) {
+                if (cells.is_empty(c) && fc_reserve_owner[c] < 0) {
+                    if (run == 0) start = c;
+                    if (++run >= need) return (int32_t) start;
+                } else {
+                    run = 0;
+                }
+            }
+            // wrap: scan the low region [0,hint); reset run at the boundary (no cross-wrap runs).
+            run = 0;
+            for (uint32_t c = 0; c < hint; ++c) {
+                if (cells.is_empty(c) && fc_reserve_owner[c] < 0) {
+                    if (run == 0) start = c;
+                    if (++run >= need) return (int32_t) start;
+                } else {
+                    run = 0;
+                }
+            }
+            return -1;
+        };
+
+        bool ok = true;
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            const llama_seq_id seq = ubatch.seq_id[i][0];
+
+            int32_t tail = fc_seq_tail[seq];
+            const bool have = tail >= 0 && tail < fc_seq_end[seq] &&
+                              cells.is_empty(tail) && fc_reserve_owner[tail] == seq;
+
+            if (!have) {
+                // Remaining tokens of THIS seq in THIS ubatch (whole prompt if n_ubatch >= prompt,
+                // else just this chunk). Reserve that plus fc_reserve gen headroom so the common
+                // case (single-ubatch prompt, gen <= headroom) needs exactly ONE contiguous run
+                // for the sequence's entire life -> zero mid-life spill, zero scatter.
+                uint32_t remain = 0;
+                for (uint32_t j = i; j < n_tokens; ++j) {
+                    if (ubatch.seq_id[j][0] == seq) {
+                        remain++;
+                    }
+                }
+                const uint32_t need = remain + fc_reserve;
+                const bool first = (fc_seq_end[seq] < 0);
+                int32_t base = -1;
+
+                // GROW-IN-PLACE: if this seq already has a run and merely exhausted its headroom
+                // (chunked prefill or a longer-than-expected generation), try to extend the run
+                // CONTIGUOUSLY at [end, end+need). fc_seq_tail == fc_seq_end here (all reserved
+                // cells consumed), so base == current tail: writes continue seamlessly with no
+                // scatter. Only fall back to a relocated run if the adjacent cells are taken.
+                if (!first) {
+                    const uint32_t end = (uint32_t) fc_seq_end[seq];
+                    if ((uint64_t) end + need <= (uint64_t) sz) {
+                        bool can_grow = true;
+                        for (uint32_t c = end; c < end + need; ++c) {
+                            if (!cells.is_empty(c) || fc_reserve_owner[c] >= 0) { can_grow = false; break; }
+                        }
+                        if (can_grow) {
+                            base = (int32_t) end;
+                        }
+                    }
+                }
+
+                // Fresh placement, or grow-in-place blocked: allocate a variable-length run near
+                // the seq's proportional hint (seq * fc_stride) to preserve seq_id order in the pool.
+                if (base < 0) {
+                    const uint32_t hint = (fc_stride > 0)
+                        ? (uint32_t) std::min((uint64_t) seq * (uint64_t) fc_stride,
+                                              (uint64_t) (need < sz ? sz - need : 0u))
+                        : 0u;
+                    base = find_run_hint(need, hint);
+                    if (base < 0) {
+                        base = find_run_hint(need, 0); // fallback: full scan from 0
+                    }
+                    if (base < 0) {
+                        ok = false;
+                        break;
+                    }
+                }
+
+                for (uint32_t c = (uint32_t) base; c < (uint32_t) base + need; ++c) {
+                    fc_reserve_owner[c] = seq;
+                }
+                // For grow-in-place base == old fc_seq_end == current fc_seq_tail, so setting tail
+                // to base is seamless; for a fresh/relocated run it (re)starts the run at base.
+                fc_seq_tail[seq] = base;
+                fc_seq_end[seq]  = base + (int32_t) need;
+                tail = base;
+            }
+
+            res.idxs[0].push_back((uint32_t) tail);
+            fc_seq_tail[seq] = tail + 1;
+        }
+
+        if (!ok) {
+            return { };
+        }
+
+        if (getenv("FC_CONTIG_DEBUG")) {
+            fprintf(stderr, "[FC_CONTIG] n_tokens=%u  first idxs:", n_tokens);
+            for (uint32_t i = 0; i < n_tokens && i < 8; ++i) {
+                fprintf(stderr, " %u(seq%d,pos%d)", res.idxs[0][i], ubatch.seq_id[i][0], ubatch.pos[i]);
+            }
+            fprintf(stderr, "  used_max_p1=%u\n", cells.used_max_p1());
+        }
+
+        return res;
+    }
+
     for (uint32_t s = 0; s < n_seqs; ++s) {
         const auto seq_id = ubatch.seq_id_unq[s];
 
@@ -1016,6 +1388,20 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         //   better to start searching from the beginning of the cache, hoping to fill it
         if (head_cur > cells.get_used() + 2*n_tokens) {
             head_cur = 0;
+        }
+
+        // [FC_FRONTFILL] Aggressive front-fill: always search from the lowest free
+        // cell so freed low-index cells are reused immediately and used_max_p1()
+        // (== the FA scan width n_kv, see get_n_kv) stays ~= live-cell count instead
+        // of drifting up toward pool size under continuous request churn. This is the
+        // fix for the "t_decode inflates 26ms->84ms under continuous load" regression:
+        // decode cost is O(batch * used_max_p1), so keeping used_max_p1 minimal keeps
+        // decode fast regardless of churn. Costs O(live_cells) scan per allocation.
+        {
+            static const int fc_frontfill = []{ const char * e = getenv("FC_FRONTFILL"); return e && atoi(e); }();
+            if (fc_frontfill) {
+                head_cur = 0;
+            }
         }
 
         if (n_tokens > cells.size()) {
@@ -1245,7 +1631,13 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
-    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+    // [FC_KV_PAD_QUANTUM] In unified mode with many concurrent slots, used_max_p1 advances by up to
+    // n_slots tokens/step, crossing the default 256 boundary every ~3 steps and resetting the CUDA
+    // graph warmup (n_kv shape change) -> eager decode. A larger quantum keeps n_kv (hence the graph
+    // shape) constant for ~quantum/n_slots steps, letting the captured decode graph REPLAY. Extra
+    // masked cells cost a few % attention work; net win when it unlocks graph reuse.
+    static const uint32_t fc_kv_pad_quantum = []{ const char * e = getenv("FC_KV_PAD_QUANTUM"); return e ? (uint32_t) atoi(e) : 0u; }();
+    const uint32_t n_pad_cur = std::max({n_pad, 256u, fc_kv_pad_quantum});
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
@@ -1254,6 +1646,39 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     }
 
     return result;
+}
+
+// fc-inference: FC_USTREAM per-stream strided view over the unified pool. Sequence s lives in the
+// exact arena [s*stride, s*stride+nkv_view) (guaranteed by find_slot's exact placement), so we can
+// present all nseq sequences as ne[3]=nseq with a regular per-stream stride nb[3]=row_size*stride.
+// This is split-KV's mask-free per-stream attention layout, but over a SINGLE unified pool.
+ggml_tensor * llama_kv_cache::get_k_ustream(ggml_context * ctx, int32_t il, uint32_t stride, uint32_t nseq, uint32_t nkv_view) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    auto * k = layers[ikv].k;
+
+    const uint64_t n_embd_k_gqa = k->ne[0];
+
+    return ggml_view_4d(ctx, k,
+            hparams.n_embd_head_k(il), hparams.n_head_kv(il), nkv_view, nseq,
+            ggml_row_size(k->type, hparams.n_embd_head_k(il)),   // nb[1]: between heads
+            ggml_row_size(k->type, n_embd_k_gqa),                // nb[2]: between cells (one row of all heads)
+            ggml_row_size(k->type, n_embd_k_gqa)*stride,         // nb[3]: between sequences (stride cells)
+            0);                                                  // seq 0 starts at cell 0
+}
+
+ggml_tensor * llama_kv_cache::get_v_ustream(ggml_context * ctx, int32_t il, uint32_t stride, uint32_t nseq, uint32_t nkv_view) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    auto * v = layers[ikv].v;
+
+    const uint64_t n_embd_v_gqa = v->ne[0];
+
+    // ustream requires the non-transposed V layout (FA fast path). Gating in apply() guarantees !v_trans.
+    return ggml_view_4d(ctx, v,
+            hparams.n_embd_head_v(il), hparams.n_head_kv(il), nkv_view, nseq,
+            ggml_row_size(v->type, hparams.n_embd_head_v(il)),   // nb[1]
+            ggml_row_size(v->type, n_embd_v_gqa),                // nb[2]
+            ggml_row_size(v->type, n_embd_v_gqa)*stride,         // nb[3]
+            0);
 }
 
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -1423,6 +1848,54 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
     ggml_set_input(v_idxs);
 
     return v_idxs;
+}
+
+// fc-inference TRACK B: block-table input tensor. I32 [1 + max_pages, n_tokens]; column i describes
+// token i's sequence: row 0 = seq KV length (cells), rows 1.. = ordered page ids. Rows are fixed at
+// kv_size/PAGE so the tensor shape only depends on n_tokens (graph-reuse friendly). Tiny: for a 64k
+// pool that is 257 x n_tokens int32.
+ggml_tensor * llama_kv_cache::build_input_bt(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    if (!fc_paged) {
+        return nullptr;
+    }
+
+    const uint32_t n_pages = (uint32_t) fc_page_owner.size();
+
+    ggml_tensor * bt = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1 + n_pages, ubatch.n_tokens);
+
+    ggml_set_input(bt);
+
+    return bt;
+}
+
+void llama_kv_cache::set_input_bt(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    if (!fc_paged || !dst) {
+        return;
+    }
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    int32_t * data = (int32_t *) dst->data;
+
+    const uint32_t n_rows = (uint32_t) dst->ne[0]; // 1 + max_pages
+    const uint32_t n_tokens = ubatch->n_tokens;
+
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        const llama_seq_id seq = ubatch->seq_id[i][0];
+        int32_t * col = data + (size_t) i * n_rows;
+
+        const auto & pages = fc_pages_of_seq[seq];
+        // Causal bound for THIS token = its position + 1 (virtual index == position under paged
+        // placement). Using fc_seq_len here would let mid-prefill tokens attend to later tokens
+        // of the same ubatch.
+        col[0] = (int32_t) (ubatch->pos[i] + 1);
+        const uint32_t np = std::min((uint32_t) pages.size(), n_rows - 1);
+        for (uint32_t p = 0; p < np; ++p) {
+            col[1 + p] = (int32_t) pages[p];
+        }
+        for (uint32_t p = np; p < n_rows - 1; ++p) {
+            col[1 + p] = 0;
+        }
+    }
 }
 
 ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
@@ -1732,7 +2205,38 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     }
 }
 
+// fc-inference: FC_USTREAM per-stream causal length mask. Because seq s's token at position p is
+// placed at arena cell offset p (cell = s*stride + p), arena offset == position, so a token at
+// position `pos` attends arena cells [0, pos]. Mask shape is [nkv_view, n_tps, 1, n_stream] with
+// stream s == seq_id s (guaranteed by the apply() gate: dense ordered seq_ids).
+template <typename T>
+static void fc_ustream_fill_mask(T * data, const llama_ubatch * ubatch, int64_t n_stream, int64_t n_tps, int64_t nkv_view) {
+    const T keep = llama_cast<T>(0.0f);
+    const T drop = llama_cast<T>(-INFINITY);
+    for (int64_t s = 0; s < n_stream; ++s) {
+        for (int64_t t = 0; t < n_tps; ++t) {
+            const int64_t   i   = s*n_tps + t;
+            const llama_pos pos = ubatch->pos[i];
+            T * col = data + (s*n_tps + t)*nkv_view;
+            for (int64_t c = 0; c < nkv_view; ++c) {
+                col[c] = ((llama_pos) c <= pos) ? keep : drop;
+            }
+        }
+    }
+}
+
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    // fc-inference TRACK C: when FC_PAGED is on and FC_SKIP_MASK=1, the FA kernels take the
+    // block-table gather path for every batch size (FC_BT_VEC_MAX >= n_ubatch), so the KQ mask
+    // is never read. Building it costs ~30ms CPU per pass at n_kv~200k (FC_MASK_PROF), fully
+    // serialized before graph compute. Skip the fill entirely.
+    if (fc_paged) {
+        static const bool fc_skip_mask = []{ const char * e = getenv("FC_SKIP_MASK"); return e && atoi(e); }();
+        if (fc_skip_mask) {
+            return;
+        }
+    }
+
     const uint32_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
@@ -1742,10 +2246,22 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
 
     GGML_ASSERT(n_tokens%n_stream == 0);
 
+    // fc-inference: FC_USTREAM discriminator. In unified mode (kv n_stream==1) a normal mask has
+    // ne[3]==1; an ne[3]>1 mask over unified storage is uniquely the ustream per-stream path.
+    if (fc_ustream && this->n_stream == 1 && n_stream > 1) {
+        const int64_t n_tps = n_tokens / n_stream;
+        if (dst->type == GGML_TYPE_F16) {
+            fc_ustream_fill_mask<ggml_fp16_t>((ggml_fp16_t *) dst->data, ubatch, n_stream, n_tps, n_kv);
+        } else {
+            fc_ustream_fill_mask<float>((float *) dst->data, ubatch, n_stream, n_tps, n_kv);
+        }
+        return;
+    }
+
     // n_tps == n_tokens_per_stream
     const int64_t n_tps = n_tokens/n_stream;
 
-    //const int64_t t_start = ggml_time_us();
+    const int64_t t_start = ggml_time_us();
 
     const args_set_input_kq_mask args = {
         /*.hparams          =*/ hparams,
@@ -1765,9 +2281,19 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
     }
 
-    //const int64_t t_end = ggml_time_us();
+    const int64_t t_end = ggml_time_us();
 
-    //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
+    // FC instrumentation: accumulate CPU KQ-mask-build time to apportion the
+    // unified-KV decode cost (CPU mask build vs GPU FA). Prints avg every 200 calls.
+    if (getenv("FC_MASK_PROF")) {
+        static int64_t s_acc_us = 0; static int64_t s_calls = 0; static int64_t s_nkv = 0; static int64_t s_ntok = 0;
+        s_acc_us += (t_end - t_start); s_calls++; s_nkv += n_kv; s_ntok += n_tokens;
+        if (s_calls % 200 == 0) {
+            LLAMA_LOG_ERROR("FC_MASK_PROF: avg kq-mask build = %0.3f ms  (avg n_kv=%lld, avg n_tokens=%lld, %lld calls)\n",
+                (double)s_acc_us/200.0/1000.0, (long long)(s_nkv/200), (long long)(s_ntok/200), (long long)s_calls);
+            s_acc_us = 0; s_nkv = 0; s_ntok = 0;
+        }
+    }
 }
 
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
@@ -2566,6 +3092,46 @@ bool llama_kv_cache_context::apply() {
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur]);
 
+    // fc-inference: FC_USTREAM per-ubatch attention gate. Present per-stream mask-free views iff the
+    // ubatch is decode-uniform-ordered: exactly one token per active seq, seq_ids dense 0..N-1 in
+    // token order (build_attn_mha derives the stream index from token position, so token i MUST be
+    // seq i). V must be non-transposed (the ustream view assumes the FA non-transposed layout).
+    // On any miss we fall back to the unified-masked path, which stays correct (no context split).
+    fc_ustream_attn = false;
+    const uint32_t stride = kv->get_fc_ustream_stride();
+    if (stride > 0) {
+        const llama_ubatch & ub = ubatches[i_cur];
+        const uint32_t nt = ub.n_tokens;
+        bool ok = nt > 1 && !kv->get_v_trans();
+        llama_pos maxpos = 0;
+        for (uint32_t i = 0; ok && i < nt; ++i) {
+            if (ub.n_seq_id[i] != 1 || ub.seq_id[i][0] != (llama_seq_id) i) {
+                ok = false;
+                break;
+            }
+            if (ub.pos[i] > maxpos) {
+                maxpos = ub.pos[i];
+            }
+        }
+        if (ok) {
+            // nkv_view = ceil(maxpos+1 -> 256) (FA KV tile), capped at the per-seq arena stride.
+            uint32_t nkv = ((uint32_t) maxpos + 1 + 255u) & ~255u;
+            if (nkv > stride) {
+                nkv = stride;
+            }
+            fc_ustream_attn   = true;
+            fc_ustream_stride = stride;
+            fc_ustream_nseq   = nt;
+            fc_ustream_nkv    = nkv;
+            static bool fc_ustream_first = true;
+            if (fc_ustream_first) {
+                fc_ustream_first = false;
+                fprintf(stderr, "[FC_USTREAM] ATTN path ACTIVE (nseq=%u nkv_view=%u stride=%u) - mask-free per-stream views\n",
+                        fc_ustream_nseq, fc_ustream_nkv, fc_ustream_stride);
+            }
+        }
+    }
+
     return true;
 }
 
@@ -2580,7 +3146,7 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 }
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
-    return n_kv;
+    return fc_ustream_attn ? fc_ustream_nkv : n_kv;
 }
 
 ggml_type llama_kv_cache_context::type_k() const {
@@ -2592,10 +3158,16 @@ ggml_type llama_kv_cache_context::type_v() const {
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
+    if (fc_ustream_attn) {
+        return kv->get_k_ustream(ctx, il, fc_ustream_stride, fc_ustream_nseq, fc_ustream_nkv);
+    }
     return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
+    if (fc_ustream_attn) {
+        return kv->get_v_ustream(ctx, il, fc_ustream_stride, fc_ustream_nseq, fc_ustream_nkv);
+    }
     return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
 }
 
@@ -2613,6 +3185,14 @@ ggml_tensor * llama_kv_cache_context::build_input_k_idxs(ggml_context * ctx, con
 
 ggml_tensor * llama_kv_cache_context::build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
     return kv->build_input_v_idxs(ctx, ubatch);
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_bt(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    return kv->build_input_bt(ctx, ubatch);
+}
+
+void llama_kv_cache_context::set_input_bt(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->set_input_bt(dst, ubatch);
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_k_rot(ggml_context * ctx) const {

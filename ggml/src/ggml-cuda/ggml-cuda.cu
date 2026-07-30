@@ -2908,16 +2908,33 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 #endif
 
     if (fcmoe_debug) {
-        // Fire once for the first call, and once for the first LARGE-batch call
-        // (the first call is llama.cpp's tiny warmup eval, not representative).
-        static bool fcmoe_probed = false;
-        static bool fcmoe_big_probed = false;
-        if (!fcmoe_probed || (!fcmoe_big_probed && ne2 > MMVQ_MAX_BATCH_SIZE)) {
-            if (ne2 > MMVQ_MAX_BATCH_SIZE) fcmoe_big_probed = true;
-            fcmoe_probed = true;
-            fprintf(stderr, "[FCMOE] mul_mat_id: type=%s ne2(tok)=%ld ne12=%ld N(ne01)=%ld K(ne00)=%ld E(ne02)=%ld eligible=%d\n",
-                ggml_type_name(src0->type), (long) ne2, (long) ne12,
-                (long) ne01, (long) ne00, (long) ne02, (int) cutlass_moe_eligible);
+        // Histogram of ne2 (token count) per mul_mat_id call, bucketed by decode/prefill
+        // regime, printed every N calls. Reveals the ACTUAL batch shape under the live
+        // conc96 workload (continuous batching mixes prefill+decode -> effective ne2 is
+        // not obvious a priori). Buckets chosen around the MMVQ/MMQ crossover (ne2=8).
+        static std::atomic<uint64_t> hist[8]  = {};   // 1,2-8,9-16,17-32,33-64,65-128,129-512,513+
+        static std::atomic<uint64_t> ncalls   = {0};
+        auto bucket = [](int64_t n) -> int {
+            if (n <= 1)   return 0;
+            if (n <= 8)   return 1;
+            if (n <= 16)  return 2;
+            if (n <= 32)  return 3;
+            if (n <= 64)  return 4;
+            if (n <= 128) return 5;
+            if (n <= 512) return 6;
+            return 7;
+        };
+        hist[bucket(ne2)].fetch_add(1, std::memory_order_relaxed);
+        const uint64_t c = ncalls.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (c % 20000 == 0) {
+            fprintf(stderr, "[FCMOE-HIST] calls=%llu N=%ld K=%ld E=%ld  ne2 buckets"
+                " [1]=%llu [2-8]=%llu [9-16]=%llu [17-32]=%llu [33-64]=%llu"
+                " [65-128]=%llu [129-512]=%llu [513+]=%llu\n",
+                (unsigned long long) c, (long) ne01, (long) ne00, (long) ne02,
+                (unsigned long long) hist[0].load(), (unsigned long long) hist[1].load(),
+                (unsigned long long) hist[2].load(), (unsigned long long) hist[3].load(),
+                (unsigned long long) hist[4].load(), (unsigned long long) hist[5].load(),
+                (unsigned long long) hist[6].load(), (unsigned long long) hist[7].load());
             fflush(stderr);
         }
     }
@@ -3721,7 +3738,25 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    // Base key = first-node pointer (stable per graph allocation; distinguishes CPU/GPU splits).
+    // [FC_GRAPH_SHAPE_KEY] Fold the batch SHAPE signature into the key so that batches with
+    // different token/KV dimensions (decode-96 vs prefill vs mixed, and different n_kv bands) map
+    // to SEPARATE graph slots instead of thrashing one slot. Without this, continuous batching
+    // constantly evicts the decode graph's warmup with prefill/mixed shapes -> 80% eager. With it,
+    // a stable decode shape keeps its own warmed slot and REPLAYS across prefill interruptions.
+    static const bool fc_shape_key = (getenv("FC_GRAPH_SHAPE_KEY") != nullptr);
+    if (!fc_shape_key || cgraph->n_nodes == 0) {
+        return cgraph->nodes[0];
+    }
+    uint64_t h = 1469598103934665603ull ^ (uint64_t) (uintptr_t) cgraph->nodes[0];
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        for (int d = 0; d < GGML_MAX_DIMS; d++) {
+            h = (h ^ (uint64_t) n->ne[d]) * 1099511628211ull;
+        }
+    }
+    // Keep it out of the low-alignment collision zone; the map only needs a distinct handle.
+    return (const void *) (uintptr_t) (h | 1);
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
@@ -5350,6 +5385,32 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
     }
 #endif // USE_CUDA_GRAPH
+
+
+    // [FC_GRAPH_PROF] measure how often the decode graph replays vs falls back to eager.
+    // Gated by env (default off, zero prod impact). Distinguishes: replay (graph reused),
+    // capture (recapture this step), eager-incompat (a node blocks graphs), eager-props
+    // (properties changed -> warmup reset -> running eager until 2 stable steps).
+    static const bool fc_graph_prof = (getenv("FC_GRAPH_PROF") != nullptr);
+    if (fc_graph_prof) {
+        static std::atomic<uint64_t> n_total{0}, n_replay{0}, n_capture{0}, n_eager{0};
+        const uint64_t t = n_total.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (use_cuda_graph && !cuda_graph_update_required) {
+            n_replay.fetch_add(1, std::memory_order_relaxed);
+        } else if (use_cuda_graph && cuda_graph_update_required) {
+            n_capture.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            n_eager.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (t % 200 == 0) {
+            fprintf(stderr, "[FC_GRAPH_PROF] calls=%llu replay=%.1f%% capture=%.1f%% eager=%.1f%%\n",
+                (unsigned long long) t,
+                100.0 * n_replay.load()  / t,
+                100.0 * n_capture.load() / t,
+                100.0 * n_eager.load()   / t);
+            fflush(stderr);
+        }
+    }
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture

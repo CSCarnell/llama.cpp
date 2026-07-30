@@ -12,6 +12,30 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * Q = dst->src[0];
 
+    // fc-inference: batched-decode narrowing. For unified-KV batched decode the FA op sees
+    // Q->ne[1] = number of concurrently-decoding sequences (each contributing a single new
+    // token, scattered across the shared KV pool). The default ncols1 selection groups up to
+    // 8 such sequences per tile, so the per-tile [KV_min,KV_max) skip degenerates to the union
+    // over 8 scattered sequences (~full pool) and the head/tail skip is wasted. Forcing the
+    // minimal ncols1 makes each tile a SINGLE sequence, so the skip bounds it to that one
+    // sequence's KV range. Gated + threshold via env (FC_FA_DECODE_NARROW=<max ne[1]>).
+    static const int fc_decode_narrow = [] {
+        const char * e = getenv("FC_FA_DECODE_NARROW");
+        return e ? atoi(e) : 0;
+    }();
+    if (fc_decode_narrow && Q->ne[1] > 1 && Q->ne[1] <= fc_decode_narrow) {
+        if constexpr (ncols2 <= 8) {
+            if (turing_mma_available(cc)) {
+                ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8/ncols2, ncols2>(ctx, dst);
+                return;
+            }
+        }
+        if constexpr (ncols2 <= 16) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16/ncols2, ncols2>(ctx, dst);
+            return;
+        }
+    }
+
     if constexpr (ncols2 <= 8) {
         if (turing_mma_available(cc) && Q->ne[1] <= 8/ncols2) {
             ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8/ncols2, ncols2>(ctx, dst);
@@ -356,6 +380,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     float max_bias = 0.0f;
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
 
+    // fc-inference TRACK B: paged block table (src[5]). The vec kernel is the only one with the
+    // per-key gather path, but it is a DECODE kernel (ncols=1) — routing prefill through it is a
+    // ~10x regression. The masked MMA/cuDNN path stays correct under paged placement (the mask is
+    // built from cell metadata, placement-agnostic), so only decode-sized batches take the gather.
+    static const int fc_bt_vec_max = [] {
+        const char * e = getenv("FC_BT_VEC_MAX");
+        return e ? atoi(e) : 256;
+    }();
+    if (dst->src[5] && Q->ne[1] <= fc_bt_vec_max) {
+        return BEST_FATTN_KERNEL_VEC;
+    }
+
     // FC: batched-decode vec kernel. Upstream gates the memory-optimal vec kernel to
     // Q->ne[3]==1 (single sequence). The vec kernel supports the stream/batch dim
     // (sequence = blockIdx.z / ne02), so for per-seq-KV batched decode (ne[1]==1,
@@ -364,6 +400,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     static const bool fc_fa_vec_batch = [] {
         const char * e = getenv("FC_FA_VEC_BATCH");
         return e && atoi(e) != 0;
+    }();
+
+    // fc-inference: route UNIFIED batched decode (Q->ne[1]=n_seq, ne[3]=1) to the vec
+    // (flash-decode) kernel instead of the wide MMA kernel. Value = max ne[1] to route; 0=off.
+    // The vec kernel gives each query its own [KV_min,KV_max) window (per-column-block bounds)
+    // with KV-split occupancy, so unified decode gets split-KV speed WITHOUT context capping.
+    static const int fc_fa_vec_unified = [] {
+        const char * e = getenv("FC_FA_VEC_UNIFIED");
+        return e ? atoi(e) : 0;
     }();
 
     // The effective batch size for the kernel can be increased by gqa_ratio.
@@ -469,6 +514,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         if (can_use_vector_kernel) {
             if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE && Q->ne[1] == 1 && (Q->ne[3] == 1 || fc_fa_vec_batch) && !(gqa_ratio > 4 && K->ne[1] >= 8192)) {
+                    return BEST_FATTN_KERNEL_VEC;
+                }
+                // fc-inference: unified batched decode -> vec with head/tail KV skip. Bypasses the
+                // gqa>4 && KV>=8192 guard on purpose: head-skip bounds each query to its own
+                // sequence's small [base,base+len) range, so the full-pool KV size is irrelevant.
+                if (cc >= GGML_CUDA_CC_ADA_LOVELACE && fc_fa_vec_unified &&
+                        Q->ne[1] >= 2 && Q->ne[1] <= fc_fa_vec_unified && Q->ne[3] == 1) {
                     return BEST_FATTN_KERNEL_VEC;
                 }
             } else {

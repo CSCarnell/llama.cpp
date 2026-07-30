@@ -174,6 +174,17 @@ public:
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
+    // fc-inference: FC_USTREAM per-sequence strided views over the UNIFIED pool. Present each
+    // sequence's exact contiguous arena [s*stride, s*stride+nkv_view) as a split-KV-style stream
+    // (ne[3]=nseq), so attention is mask-free-per-stream over unified storage (no context split).
+    ggml_tensor * get_k_ustream(ggml_context * ctx, int32_t il, uint32_t stride, uint32_t nseq, uint32_t nkv_view) const;
+    ggml_tensor * get_v_ustream(ggml_context * ctx, int32_t il, uint32_t stride, uint32_t nseq, uint32_t nkv_view) const;
+
+    // ustream stride in cells (0 = disabled). Exact-arena placement uses this; attention gating is per-ubatch.
+    uint32_t get_fc_ustream_stride() const { return fc_ustream ? fc_ustream_stride : 0; }
+    bool     get_fc_paged()         const { return fc_paged; }
+    bool     get_v_trans()          const { return v_trans; }
+
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
@@ -205,6 +216,12 @@ public:
 
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
+
+    // fc-inference TRACK B: paged-KV block table input. I32 [1 + max_pages, n_tokens]; column i =
+    // block table of token i's seq: row 0 = seq KV length (cells), rows 1.. = page ids. nullptr
+    // unless FC_PAGED. Attached to flash_attn_ext as src[5]; ignored by kernels until Phase 3.
+    ggml_tensor * build_input_bt(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    void set_input_bt(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
@@ -278,6 +295,42 @@ private:
 
     // maps from a sequence id to a stream id
     std::vector<uint32_t> seq_to_stream;
+
+    // fc-inference: contiguous per-sequence KV allocation (env FC_CONTIG_KV=1, unified n_stream==1).
+    // Default packing places every sequence's tokens at ONE global advancing head, so each
+    // sequence's decode cells scatter with stride ~n_seq across the pool -> [KV_min,KV_max] degenerates
+    // to the whole pool and the flash-attn block-skip cannot fire. Instead, grow each sequence inside
+    // its own contiguous reserved run drawn from the shared pool (no per-slot context cap). Combined
+    // with ncols1=1 decode tiling this makes each decode query scan only its own ~len cells. Not persisted.
+    bool                  fc_contig = false;
+    uint32_t              fc_reserve = 512;            // decode headroom reserved after each prefill run
+    uint32_t              fc_stride  = 0;              // [FC_CONTIG_STRIDE] >0 => ordered placement: seq s owns fixed home [s*stride,(s+1)*stride) so KV pos == seq order (FA tiles cover KV-adjacent seqs)
+    mutable std::vector<int32_t>  fc_reserve_owner;    // per pool cell: seq_id reserving it, else -1 (find_slot is const)
+    mutable std::vector<int32_t>  fc_seq_tail;         // per seq: next contiguous cell to write, else -1
+    mutable std::vector<int32_t>  fc_seq_end;         // per seq: reservation end
+    // fc-inference: FC_USTREAM exact-arena placement (unified n_stream==1). seq s -> cells
+    // [s*fc_ustream_stride, (s+1)*fc_ustream_stride). Enables mask-free per-stream attention views.
+    bool                  fc_ustream        = false;
+    uint32_t              fc_ustream_stride = 0;
+
+    // fc-inference TRACK B: FC_PAGED=1 true paged KV allocation (unified n_stream==1 only).
+    // Pool is divided into pages of FC_PAGE_SIZE cells (== FATTN_KQ_STRIDE so page boundaries align
+    // with FA kernel KV tiles). Each page is owned by exactly one seq. A seq's cell for pos p is
+    // fc_pages_of_seq[s][p / PAGE]*PAGE + p % PAGE. Pages come from a free-list stack; seq_rm/clear
+    // return them. NO per-seq capacity cap: one seq may own every page (P1 unbounded by construction).
+    // Phase 1 runs on the existing unified MASKED attention path (correct for scattered cells);
+    // the block-table gather kernel (Phase 3) is a pure speed upgrade on top.
+    static constexpr uint32_t FC_PAGE_SIZE = 256;
+    bool                  fc_paged = false;
+    mutable std::vector<std::vector<uint32_t>> fc_pages_of_seq; // seq -> ordered page ids
+    mutable std::vector<uint32_t> fc_seq_len;                   // seq -> #cells in use (tail fill = len % PAGE)
+    mutable std::vector<uint32_t> fc_free_pages;                // stack of free page ids
+    // page -> owning seq, -1 = free, -2 = orphan (owner died but cells still referenced via seq_cp
+    // sharing; swept back to the free list once every cell in the page is empty).
+    mutable std::vector<int32_t>  fc_page_owner;
+    void fc_paged_reclaim() const; // return dead seqs' pages to the free list (called from seq_rm/clear)
+    // find_slot is const but must reserve pages; apply_ubatch commits. Rollback on failed find_slot
+    // is handled by tracking per-call allocations (see fc_paged_alloc in find_slot).
 
     // pending stream copies that will be applied during the next update
     stream_copy_info sc_info;
@@ -364,6 +417,10 @@ public:
 
     uint32_t get_n_kv() const;
 
+    // fc-inference: FC_USTREAM per-ubatch attention gating (decided in apply()).
+    bool     is_ustream()       const { return fc_ustream_attn; }
+    uint32_t get_ustream_nseq() const { return fc_ustream_nseq; }
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 
@@ -388,6 +445,10 @@ public:
 
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
+
+    // fc-inference TRACK B: paged block-table input (nullptr unless FC_PAGED)
+    ggml_tensor * build_input_bt(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    void set_input_bt(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
@@ -431,4 +492,11 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+
+    // fc-inference: FC_USTREAM per-ubatch attention params (computed in apply()).
+    // fc_ustream_attn => present K/V as nseq strided per-stream views (mask-free) over the unified pool.
+    bool     fc_ustream_attn   = false;
+    uint32_t fc_ustream_stride = 0;
+    uint32_t fc_ustream_nseq   = 0;
+    uint32_t fc_ustream_nkv    = 0;
 };

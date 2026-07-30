@@ -324,9 +324,13 @@ public:
     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
 
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
+    ggml_tensor * get_bt()      const { return self_bt; }
 
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
+
+    // fc-inference TRACK B: paged-KV block table, I32 [1+max_pages, n_batch] (nullptr unless FC_PAGED)
+    ggml_tensor * self_bt = nullptr;
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
@@ -1053,7 +1057,8 @@ struct llm_graph_context {
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * bt = nullptr) const; // fc-inference TRACK B: paged block table -> FA src[5]
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

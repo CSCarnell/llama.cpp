@@ -85,12 +85,39 @@ static __device__ __forceinline__ void fcfa_atomic_max_pos(float * addr, float v
 //   src_is_f32=0: src is half* base (already band-offset), ELEMENT strides (K/V)
 //   extras: 0=K (descale only); 1=Q (also ds[3]=1/448, ds[4]=448);
 //           2=V (also ds[5]=448/amax_v -> scale_o, O reuses V range)
+// fc-inference PAGED-GATHER: page size of the FC_PAGED KV pool (== FC_PAGE_SIZE ==
+// FATTN_KQ_STRIDE). Virtual row s lives at physical row pages[s>>8]*256 + (s&255).
+static constexpr int64_t FCFA_PAGE = 256;
+
+// f16 KV gather: virtual-order rows -> contiguous f16 [s][h][d] scratch for the HALF
+// cuDNN path. Rows >= n_real (bucket padding) are zero-filled (padding-masked, inert).
+static __global__ void k_fcfa_gather_kv_f16(
+        const char * __restrict__ src, half * __restrict__ dst,
+        const int32_t * __restrict__ pages,
+        const int64_t d, const int64_t n_rows, const int64_t h,
+        const int64_t nb1, const int64_t nb2, const int64_t n_real) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= d*n_rows*h) {
+        return;
+    }
+    const int64_t x = i % d;
+    const int64_t hh = (i / d) % h;
+    const int64_t s = i / (d*h);
+    if (s >= n_real) {
+        dst[i] = __float2half(0.0f);
+        return;
+    }
+    const int64_t phys = (int64_t) pages[s / FCFA_PAGE]*FCFA_PAGE + (s % FCFA_PAGE);
+    dst[i] = ((const half *) src)[phys*nb1 + hh*nb2 + x];
+}
+
 static __global__ void k_fcfa_stage_fused(
         const char * __restrict__ src, __nv_fp8_e4m3 * __restrict__ dst,
         const int64_t d, const int64_t n, const int64_t h,
         const int64_t nb1, const int64_t nb2, const int src_is_f32,
         float * __restrict__ amax_scratch, float * __restrict__ descale_out,
-        const int extras, float * __restrict__ dsb) {
+        const int extras, float * __restrict__ dsb,
+        const int32_t * __restrict__ pages) { // fc: optional paged gather (nullptr = identity)
     namespace cg = cooperative_groups;
     cg::grid_group grid = cg::this_grid();
     const int64_t total  = d*n*h;
@@ -100,10 +127,11 @@ static __global__ void k_fcfa_stage_fused(
     if (gtid == 0) *amax_scratch = 0.0f;
     grid.sync();
 
-    // pass 1: amax over the strided view
+    // pass 1: amax over the strided view (fc: `pages` remaps virtual row -> physical page row)
     float m = 0.0f;
     for (int64_t i = gtid; i < total; i += stride) {
-        const int64_t x = i % d, hh = (i / d) % h, s = i / (d*h);
+        const int64_t x = i % d, hh = (i / d) % h, s0 = i / (d*h);
+        const int64_t s = pages ? (int64_t) pages[s0 / FCFA_PAGE]*FCFA_PAGE + (s0 % FCFA_PAGE) : s0;
         const float val = src_is_f32
             ? ((const float *) (src + s*nb1 + hh*nb2))[x]
             : __half2float(((const half *) src)[s*nb1 + hh*nb2 + x]);
@@ -122,7 +150,8 @@ static __global__ void k_fcfa_stage_fused(
     const float amax   = fmaxf(*amax_scratch, 1e-6f);
     const float qscale = FCFA_E4M3_MAX / amax;
     for (int64_t i = gtid; i < total; i += stride) {
-        const int64_t x = i % d, hh = (i / d) % h, s = i / (d*h);
+        const int64_t x = i % d, hh = (i / d) % h, s0 = i / (d*h);
+        const int64_t s = pages ? (int64_t) pages[s0 / FCFA_PAGE]*FCFA_PAGE + (s0 % FCFA_PAGE) : s0;
         const float val = src_is_f32
             ? ((const float *) (src + s*nb1 + hh*nb2))[x]
             : __half2float(((const half *) src)[s*nb1 + hh*nb2 + x]);
@@ -141,7 +170,7 @@ static void fcfa_launch_stage(
         const void * src, __nv_fp8_e4m3 * dst,
         int64_t d, int64_t n, int64_t h, int64_t nb1, int64_t nb2, int src_is_f32,
         float * amax_scratch, float * descale_out, int extras, float * dsb,
-        cudaStream_t stream) {
+        cudaStream_t stream, const int32_t * pages = nullptr) {
     static int grid_blocks = 0;
     if (grid_blocks == 0) {
         int dev = 0; cudaGetDevice(&dev);
@@ -153,7 +182,8 @@ static void fcfa_launch_stage(
     const char * csrc = (const char *) src;
     void * args[] = { (void *) &csrc, (void *) &dst, (void *) &d, (void *) &n, (void *) &h,
                       (void *) &nb1, (void *) &nb2, (void *) &src_is_f32,
-                      (void *) &amax_scratch, (void *) &descale_out, (void *) &extras, (void *) &dsb };
+                      (void *) &amax_scratch, (void *) &descale_out, (void *) &extras, (void *) &dsb,
+                      (void *) &pages };
     cudaLaunchCooperativeKernel((const void *) k_fcfa_stage_fused,
         dim3((unsigned) grid_blocks), dim3(256), args, 0, stream);
 }
@@ -253,6 +283,16 @@ struct fcfa_state {
     int32_t band_lo     = 0; // L: constant first allowed key (kv-unified slot offset)
     int32_t band_n_past = 0; // D: row i allows [L, L+D+i]
     std::vector<int32_t> h_probe;
+    // per-graph-eval paged block-table verdict cache (BT identical across layers):
+    uint64_t bt_gen = 0;
+    const void * bt_ptr = nullptr;
+    int64_t bt_n_q = -1;
+    bool bt_checked = false;
+    bool bt_is_band = false;
+    int32_t bt_n_past = 0;
+    int32_t bt_seq_kv = 0;
+    int64_t bt_np     = 0;
+    std::vector<int32_t> h_bt; // D2H staging for BT validation (3 columns)
 };
 
 static fcfa_state & fcfa_get_state() {
@@ -289,7 +329,8 @@ static bool fcfa_run_fp8(
         ggml_backend_cuda_context & ctx, fcfa_state & st, ggml_tensor * dst,
         const ggml_tensor * Q, const ggml_tensor * K, const ggml_tensor * V,
         int32_t band_lo, int32_t seq_kv, int64_t dim_kv, float scale,
-        int64_t n_q, int64_t h_q, int64_t h_k, int64_t d, int64_t dv, cudaStream_t stream) {
+        int64_t n_q, int64_t h_q, int64_t h_k, int64_t d, int64_t dv, cudaStream_t stream,
+        const int32_t * pages_dev = nullptr) { // fc PAGED-GATHER: device page list (nullptr = contiguous KV)
     static std::map<fcfa_graph_key, fcfa_graph_entry> g_fp8_graphs;
 
     // FP8 sdpa engines support causal-bottom-right, NOT the padding-mask+seq_len
@@ -398,10 +439,12 @@ static bool fcfa_run_fp8(
     // launch each (grid.sync between passes). 8 launches -> 3, descales inline.
     fcfa_launch_stage(Q->data, q_fp8.get(), d, n_q, h_q,
         (int64_t) Q->nb[1], (int64_t) Q->nb[2], /*f32*/1, amax.get()+0, dsb.get()+0, /*Q*/1, dsb.get(), stream);
+    // fc PAGED-GATHER: pages_dev remaps virtual KV rows -> physical page rows inside the
+    // same fused stage pass (zero extra kernel launches vs the contiguous path).
     fcfa_launch_stage(base_k, k_fp8.get(), d, dim_kv_fp8, h_k,
-        k_nb1, k_nb2, /*f16*/0, amax.get()+1, dsb.get()+1, /*K*/0, dsb.get(), stream);
+        k_nb1, k_nb2, /*f16*/0, amax.get()+1, dsb.get()+1, /*K*/0, dsb.get(), stream, pages_dev);
     fcfa_launch_stage(base_v, v_fp8.get(), d, dim_kv_fp8, h_k,
-        v_nb1, v_nb2, /*f16*/0, amax.get()+2, dsb.get()+2, /*V*/2, dsb.get(), stream);
+        v_nb1, v_nb2, /*f16*/0, amax.get()+2, dsb.get()+2, /*V*/2, dsb.get(), stream, pages_dev);
 
     std::unordered_map<int64_t, void *> pack = {
         {UID_Q,      q_fp8.get()},
@@ -463,13 +506,20 @@ bool ggml_cuda_flash_attn_ext_cudnn_try(ggml_backend_cuda_context & ctx, ggml_te
     const int64_t dv  = V->ne[0];
 
     // static eligibility gates
-    if (mask == nullptr || sinks != nullptr || max_bias != 0.0f || logit_softcap != 0.0f) {
+    // fc-inference PAGED-GATHER (see below): src[5] (paged block table) enables a
+    // VIRTUAL-space band derived from the BT itself — no mask needed. Without a BT,
+    // the ggml mask must prove out as an exact bottom-right causal band.
+    const ggml_tensor * bt = dst->src[5];
+    if (sinks != nullptr || max_bias != 0.0f || logit_softcap != 0.0f) {
+        return false;
+    }
+    if (mask == nullptr && bt == nullptr) {
         return false;
     }
     if (n_q < min_q) { // prefill only; decode keeps the tuned builtin path
         return false;
     }
-    if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 || mask->type != GGML_TYPE_F16) {
+    if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16) {
         return false;
     }
     if (d != 128 || dv != 128) { // the only shape validated so far
@@ -478,22 +528,142 @@ bool ggml_cuda_flash_attn_ext_cudnn_try(ggml_backend_cuda_context & ctx, ggml_te
     if (h_k <= 0 || h_q % h_k != 0) {
         return false;
     }
-    if (Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1 || mask->ne[3] != 1 || mask->ne[2] != 1) {
-        return false;
-    }
-    if (mask->ne[0] < n_kv || mask->ne[1] < n_q) {
+    if (Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1) {
         return false;
     }
     // element strides (all tensors f16/f32 with d contiguous required)
     if (Q->nb[0] != sizeof(float) || K->nb[0] != sizeof(half) || V->nb[0] != sizeof(half)) {
         return false;
     }
-    if (!ggml_is_contiguous(mask) || !ggml_is_contiguous(dst)) {
+    if (!ggml_is_contiguous(dst)) {
         return false;
     }
 
     fcfa_state & st = fcfa_get_state();
     cudaStream_t stream = ctx.stream();
+
+    // CUDA-graph capture guard: if this eval is being CAPTURED (FC_MMID_GRAPHS et al),
+    // refuse. cuDNN's execute() bakes host-side decisions (seq lengths via kernel args,
+    // band bounds, graph plan selection) into the captured graph; on replay with a
+    // different request those go stale and silently corrupt the KV/attention output
+    // (measured: needle retrieval returned '0' under FC_MMID_GRAPHS + BT band). The
+    // builtin MMA/vec kernels are the graph-update-safe path — let them take it.
+    {
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(stream, &cap));
+        if (cap != cudaStreamCaptureStatusNone) {
+            if (fcfa_log_enabled()) {
+                static int64_t logged = 0;
+                if (logged++ % 48 == 0) {
+                    fprintf(stderr, "[FCFA-cuDNN] stream is CAPTURING -> builtin path (n_q=%ld)\n", (long) n_q);
+                }
+            }
+            return false;
+        }
+    }
+
+    // ---- fc-inference PAGED-GATHER band derivation (Track B/C completion) ----
+    // Under FC_PAGED the physical mask is a band only when pages happen to be laid out
+    // in virtual order; once the pool fragments (long-lived IDE sessions) the probe fails
+    // and prefill used to drop to masked MMA (~-25% server prefill). The block table
+    // gives us the band DIRECTLY in virtual space: BT column i = [causal_bound, pages...],
+    // bound = pos_i + 1. If the ubatch is one seq with sequential positions (the standard
+    // prefill chunk), then in virtual key order row i allows exactly [0, bound0-1+i] — a
+    // perfect bottom-right causal band with band_lo=0. K/V virtual rows are gathered
+    // through the page list into contiguous scratch (FP8: fused into the existing stage
+    // kernel, zero extra passes; HALF: one gather copy). The BT lives in a host-pinned
+    // buffer (set_input_bt asserts is_host), so the CPU validates it with plain reads —
+    // no device sync. Escape hatch: GGML_CUDA_NO_PAGED_CUDNN=1.
+    static const bool paged_cudnn_off = getenv("GGML_CUDA_NO_PAGED_CUDNN") != nullptr;
+    int32_t band_lo = 0;
+    int32_t n_past  = 0;
+    int32_t seq_kv  = 0;
+    const int32_t * bt_pages_dev = nullptr; // DEVICE page list (virtual order) when use_bt
+    int64_t bt_np = 0;                      // number of pages covering [0, seq_kv)
+    bool use_bt = false;
+    if (bt != nullptr && !paged_cudnn_off && bt->type == GGML_TYPE_I32) {
+        // NOTE: bt->data is DEVICE memory here (the scheduler's copy of the host input
+        // tensor — same pointer the vec kernel reads in-kernel). CPU validation therefore
+        // stages 3 columns D2H (~1KB each); verdict cached across all layers of the eval.
+        const int32_t * btd = (const int32_t *) bt->data;
+        const int64_t  nr  = bt->ne[0]; // 1 + max_pages
+        const uint64_t gen = g_fcfa_gen.load(std::memory_order_relaxed);
+        if (!(st.bt_checked && st.bt_gen == gen && st.bt_ptr == (const void *) btd && st.bt_n_q == n_q)) {
+            st.bt_checked = true;
+            st.bt_gen = gen; st.bt_ptr = btd; st.bt_n_q = n_q;
+            st.bt_is_band = false;
+            // ORDERING (root-cause of the '0'-answer corruption): the scheduler queues the
+            // BT H2D copy on the MAIN stream; an unordered side-stream read can see the
+            // PREVIOUS eval's BT (stale band bounds -> corrupt attention). Record an event
+            // on the main stream (legal: capture already bailed above) and make the side
+            // stream wait on it, so the D2H reads THIS eval's data. Host-syncs only the
+            // side stream, and only once per eval (verdict cached across layers). The FA
+            // node sits early in layer 0, so the main-stream queue is still shallow here.
+            static cudaStream_t bt_stream = [] {
+                cudaStream_t s = nullptr;
+                cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
+                return s;
+            }();
+            static cudaEvent_t bt_ev = [] {
+                cudaEvent_t e = nullptr;
+                cudaEventCreateWithFlags(&e, cudaEventDisableTiming);
+                return e;
+            }();
+            CUDA_CHECK(cudaEventRecord(bt_ev, stream));
+            CUDA_CHECK(cudaStreamWaitEvent(bt_stream, bt_ev, 0));
+            st.h_bt.resize(3*nr);
+            CUDA_CHECK(cudaMemcpyAsync(st.h_bt.data() + 0*nr, btd,                        nr*sizeof(int32_t), cudaMemcpyDeviceToHost, bt_stream));
+            CUDA_CHECK(cudaMemcpyAsync(st.h_bt.data() + 1*nr, btd + (n_q/2)*nr,           nr*sizeof(int32_t), cudaMemcpyDeviceToHost, bt_stream));
+            CUDA_CHECK(cudaMemcpyAsync(st.h_bt.data() + 2*nr, btd + (int64_t)(n_q-1)*nr,  nr*sizeof(int32_t), cudaMemcpyDeviceToHost, bt_stream));
+            CUDA_CHECK(cudaStreamSynchronize(bt_stream));
+            const int32_t * c0 = st.h_bt.data();
+            const int32_t * cM = st.h_bt.data() + 1*nr;
+            const int32_t * cN = st.h_bt.data() + 2*nr;
+            const int32_t bound0 = c0[0], boundM = cM[0], boundN = cN[0];
+            if (bound0 >= 1 && boundN - bound0 == (int32_t) (n_q - 1)
+                            && boundM - bound0 == (int32_t) (n_q/2) && (int64_t) boundN <= n_kv) {
+                const int64_t np = ((int64_t) boundN + FCFA_PAGE - 1) / FCFA_PAGE;
+                // same-seq check: first/mid/last tokens must share the page list prefix
+                // (pages are exclusively owned by one seq, so equal prefixes == same seq)
+                if (np <= nr - 1 &&
+                    memcmp(c0 + 1, cN + 1, np*sizeof(int32_t)) == 0 &&
+                    memcmp(c0 + 1, cM + 1, np*sizeof(int32_t)) == 0) {
+                    st.bt_is_band = true;
+                    st.bt_n_past  = bound0 - 1; // tokens of this seq already in cache
+                    st.bt_seq_kv  = boundN;     // n_past + n_q
+                    st.bt_np      = np;
+                    if (fcfa_log_enabled()) {
+                        fprintf(stderr, "[FCFA-cuDNN] BT band n_q=%ld n_past=%d seq_kv=%d pages=%ld\n",
+                            (long) n_q, (int) st.bt_n_past, (int) st.bt_seq_kv, (long) np);
+                    }
+                }
+            }
+        }
+        if (st.bt_is_band) {
+            use_bt        = true;
+            band_lo       = 0;            // virtual space starts at 0
+            n_past        = st.bt_n_past;
+            seq_kv        = st.bt_seq_kv;
+            bt_pages_dev  = btd + 1;      // device page list, column 0 (all cols share the prefix)
+            bt_np         = st.bt_np;
+        }
+        // invalid BT (multi-seq / non-sequential ubatch) -> fall through to mask probe
+    }
+
+    if (!use_bt) {
+    // mask-path gates (skipped when the BT provides the band)
+    if (mask == nullptr || mask->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (mask->ne[3] != 1 || mask->ne[2] != 1) {
+        return false;
+    }
+    if (mask->ne[0] < n_kv || mask->ne[1] < n_q) {
+        return false;
+    }
+    if (!ggml_is_contiguous(mask)) {
+        return false;
+    }
 
     // ---- mask band proof (cached per graph eval) ----
     const uint64_t gen = g_fcfa_gen.load(std::memory_order_relaxed);
@@ -552,9 +722,10 @@ bool ggml_cuda_flash_attn_ext_cudnn_try(ggml_backend_cuda_context & ctx, ggml_te
     if (!st.mask_is_band) {
         return false;
     }
-    const int32_t band_lo = st.band_lo;
-    const int32_t n_past  = st.band_n_past;
-    const int32_t seq_kv  = n_past + (int32_t) n_q; // real keys from band_lo; rows beyond are padding-masked
+    band_lo = st.band_lo;
+    n_past  = st.band_n_past;
+    seq_kv  = n_past + (int32_t) n_q; // real keys from band_lo; rows beyond are padding-masked
+    } // if (!use_bt)
 
     // ---- graph lookup / build ----
     if (st.handle == nullptr) {
@@ -599,9 +770,11 @@ bool ggml_cuda_flash_attn_ext_cudnn_try(ggml_backend_cuda_context & ctx, ggml_te
         const char * s = getenv("GGML_CUDA_CUDNN_FA_FP8_MIN_KV");
         return s ? atoll(s) : 4096;
     }();
+
     if (fcfa_use_fp8 && (int64_t) seq_kv >= fcfa_fp8_min_kv) {
         if (fcfa_run_fp8(ctx, st, dst, Q, K, V, band_lo, seq_kv, dim_kv,
-                         scale, n_q, h_q, h_k, d, dv, stream)) {
+                         scale, n_q, h_q, h_k, d, dv, stream,
+                         bt_pages_dev)) { // nullptr unless paged gather
             return true;
         }
         // fall through to HALF path on any FP8 failure (build/execute) so
@@ -613,10 +786,16 @@ bool ggml_cuda_flash_attn_ext_cudnn_try(ggml_backend_cuda_context & ctx, ggml_te
     key.h_q  = h_q;  key.h_k  = h_k;
     key.d    = d;    key.dv   = dv;
     key.q_nb1 = 0;   key.q_nb2 = 0; // Q staged contiguous
-    key.k_nb1 = (int64_t) (K->nb[1]/sizeof(half));
-    key.k_nb2 = (int64_t) (K->nb[2]/sizeof(half));
-    key.v_nb1 = (int64_t) (V->nb[1]/sizeof(half));
-    key.v_nb2 = (int64_t) (V->nb[2]/sizeof(half));
+    if (use_bt) {
+        // fc PAGED-GATHER: K/V gathered into contiguous interleaved [s][h][d] scratch
+        key.k_nb1 = d*h_k; key.k_nb2 = d;
+        key.v_nb1 = d*h_k; key.v_nb2 = d;
+    } else {
+        key.k_nb1 = (int64_t) (K->nb[1]/sizeof(half));
+        key.k_nb2 = (int64_t) (K->nb[2]/sizeof(half));
+        key.v_nb1 = (int64_t) (V->nb[1]/sizeof(half));
+        key.v_nb2 = (int64_t) (V->nb[2]/sizeof(half));
+    }
     memcpy(&key.scale_bits, &scale, sizeof(scale));
 
     auto it = st.graphs->find(key);
@@ -677,6 +856,7 @@ bool ggml_cuda_flash_attn_ext_cudnn_try(ggml_backend_cuda_context & ctx, ggml_te
     ggml_cuda_pool_alloc<half>    q_f16(ctx.pool(), d*n_q*h_q);
     ggml_cuda_pool_alloc<half>    o_f16(ctx.pool(), dv*n_q*h_q);
     ggml_cuda_pool_alloc<int32_t> seqs (ctx.pool(), 2);
+    ggml_cuda_pool_alloc<half>    k_g, v_g; // fc PAGED-GATHER scratch
     ggml_cuda_pool_alloc<char>    ws;
     if (ent.ws_size > 0) {
         ws.alloc(ctx.pool(), ent.ws_size);
@@ -688,12 +868,26 @@ bool ggml_cuda_flash_attn_ext_cudnn_try(ggml_backend_cuda_context & ctx, ggml_te
         k_fcfa_q_f32_to_f16<<<(unsigned) ((n + blk - 1)/blk), blk, 0, stream>>>(
             (const char *) Q->data, q_f16.get(), d, n_q, h_q, (int64_t) Q->nb[1], (int64_t) Q->nb[2]);
     }
+    if (use_bt) {
+        // gather virtual-order K/V rows through the page list into contiguous scratch;
+        // rows in [seq_kv, dim_kv) are bucket padding -> zero-filled (padding-masked).
+        k_g.alloc(ctx.pool(), d*dim_kv*h_k);
+        v_g.alloc(ctx.pool(), d*dim_kv*h_k);
+        const int64_t n = d*dim_kv*h_k;
+        const int blk = 256;
+        k_fcfa_gather_kv_f16<<<(unsigned) ((n + blk - 1)/blk), blk, 0, stream>>>(
+            (const char *) K->data, k_g.get(), bt_pages_dev, d, dim_kv, h_k,
+            (int64_t) (K->nb[1]/sizeof(half)), (int64_t) (K->nb[2]/sizeof(half)), (int64_t) seq_kv);
+        k_fcfa_gather_kv_f16<<<(unsigned) ((n + blk - 1)/blk), blk, 0, stream>>>(
+            (const char *) V->data, v_g.get(), bt_pages_dev, d, dim_kv, h_k,
+            (int64_t) (V->nb[1]/sizeof(half)), (int64_t) (V->nb[2]/sizeof(half)), (int64_t) seq_kv);
+    }
     k_fcfa_set_seq<<<1, 1, 0, stream>>>(seqs.get(), (int32_t) n_q, seq_kv);
 
     std::unordered_map<int64_t, void *> pack = {
         {UID_Q,      q_f16.get()},
-        {UID_K,      (char *) K->data + (int64_t) band_lo*K->nb[1]},
-        {UID_V,      (char *) V->data + (int64_t) band_lo*V->nb[1]},
+        {UID_K,      use_bt ? (void *) k_g.get() : (void *) ((char *) K->data + (int64_t) band_lo*K->nb[1])},
+        {UID_V,      use_bt ? (void *) v_g.get() : (void *) ((char *) V->data + (int64_t) band_lo*V->nb[1])},
         {UID_O,      o_f16.get()},
         {UID_SEQ_Q,  seqs.get()},
         {UID_SEQ_KV, seqs.get() + 1},

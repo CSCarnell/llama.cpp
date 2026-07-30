@@ -25,6 +25,9 @@ static __global__ void flash_attn_ext_vec(
         const char * mask_ptr,
         const char * sinks_ptr,
         const int  * KV_max_ptr,
+        const int  * KV_min_ptr, // fc-inference: head-skip bound (unused by vec kernel, kept for signature parity)
+        const int32_t * BT_ptr,  // fc-inference TRACK B: paged block table, I32 [1+max_pages, n_tokens]; col = [causal_len, page0, page1, ...]
+        const int32_t   bt_nr,   // rows per BT column (= 1 + max_pages)
         float      * dst_ptr,
         float2     * dst_meta_ptr,
         const float scale,
@@ -53,7 +56,7 @@ static __global__ void flash_attn_ext_vec(
 
     // Skip unused kernel variants for faster compilation:
     if (use_logit_softcap && !(D == 128 || D == 256)) {
-        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
+        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, BT_ptr, bt_nr, dst, dst_meta, scale,
             max_bias, m0, m1, n_head_log2, logit_softcap,
             ne00, ne01, ne02, ne03,
                   nb01, nb02, nb03,
@@ -109,6 +112,19 @@ static __global__ void flash_attn_ext_vec(
     Q += nb03*sequence + nb02* head              + nb01*ic0;
     K += nb13*sequence + nb12*(head / gqa_ratio);
     V += nb23*sequence + nb22*(head / gqa_ratio);
+
+    // fc-inference TRACK B: paged KV gather. BT column for this Q token = [causal_len, page0, page1, ...].
+    // Virtual key index v lives at pool cell pages[v>>8]*256 + (v&255) (page = 256 cells = FATTN_KQ_STRIDE).
+    // ncols==1 is enforced at dispatch when a block table is present (tokens may have different tables).
+    const int32_t * bt_pages = nullptr;
+    int bt_len = 0;
+    if (BT_ptr) {
+        const int32_t * bt_col = BT_ptr + (int64_t) ic0 * bt_nr;
+        bt_len   = bt_col[0];
+        bt_pages = bt_col + 1;
+    }
+    const char * K_base = K; // head-offset base pointers for paged gather (row offset applied per-key)
+    const char * V_base = V;
 
     const half * maskh  = (const half  *) (mask + nb33*(sequence % ne33) + nb31*ic0);
 
@@ -247,11 +263,22 @@ static __global__ void flash_attn_ext_vec(
 #endif // V_DOT2_F32_F16_AVAILABLE
     }
 
-    const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
-    K     += blockIdx.y*nthreads * nb11;
-    V     += blockIdx.y*nthreads * nb21;
-    maskh += blockIdx.y*nthreads;
-    for (int k_VKQ_0 = blockIdx.y*nthreads; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nthreads,
+    // fc-inference TRACK B: in paged mode the loop runs over VIRTUAL per-sequence key indices
+    // [0, bt_len) (bt_len = causal bound of this Q token); KV_max/KV_min are pool-physical and
+    // do not apply. The mask is not consulted (exclusion is by causal bound + page ownership).
+    const int k_VKQ_max = BT_ptr ? bt_len : (KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11);
+    // fc-inference: head-skip for unified batched decode. In a unified KV cache a sequence's
+    // cells begin at a large base offset; every cell before KV_min is fully masked for every
+    // query in this column-block, so loading it is pure waste (the reason naive vec-on-unified
+    // is slower than MMA). Start the KV loop at KV_min (floored to an nthreads boundary so the
+    // flash-decode KV-split tiling stays aligned). With both head-skip (KV_min) and tail-skip
+    // (KV_max) each query touches only its own sequence's [base, base+len) range -> this is the
+    // llama.cpp equivalent of vLLM paged flash-decoding, giving split-KV speed with unified ctx.
+    const int k_VKQ_min = BT_ptr ? 0 : (KV_min_ptr ? (KV_min_ptr[sequence*gridDim.x + blockIdx.x] / nthreads) * nthreads : 0);
+    K     += (k_VKQ_min + blockIdx.y*nthreads) * nb11;
+    V     += (k_VKQ_min + blockIdx.y*nthreads) * nb21;
+    maskh += (k_VKQ_min + blockIdx.y*nthreads);
+    for (int k_VKQ_0 = k_VKQ_min + blockIdx.y*nthreads; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nthreads,
              // Increment pointers after each loop:
              K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
 
@@ -268,16 +295,32 @@ static __global__ void flash_attn_ext_vec(
         for (int i_KQ_0 = 0; i_KQ_0 < nthreads_KQ; ++i_KQ_0) {
             const int i_KQ = threadIdx.y*WARP_SIZE + (nthreads_KQ == WARP_SIZE ? 0 : (threadIdx.x & ~(nthreads_KQ-1))) + i_KQ_0;
 
+            // fc-inference TRACK B: paged gather. Virtual key v -> pool cell pages[v>>8]*256 + (v&255).
+            // Keys past the causal bound are clamped to a safe address (v=0) and excluded below.
+            const char * K_row;
+            if (BT_ptr) {
+                const int v  = k_VKQ_0 + i_KQ;
+                const int vc = v < k_VKQ_max ? v : 0;
+                K_row = K_base + ((int64_t) bt_pages[vc >> 8] * FATTN_KQ_STRIDE + (vc & (FATTN_KQ_STRIDE-1))) * (int64_t) nb11;
+            } else {
+                K_row = K + i_KQ*nb11;
+            }
+
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
-                float sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+                float sum = vec_dot_KQ(K_row, Q_reg[j], Q_i32[j], Q_ds[j]);
                 sum = warp_reduce_sum<nthreads_KQ>(sum);
 
                 if (use_logit_softcap) {
                     sum = logit_softcap*tanhf(sum);
                 }
 
-                if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
+                if (BT_ptr) {
+                    // paged mode: no mask reads; exclude keys past this token's causal bound
+                    if (k_VKQ_0 + i_KQ >= k_VKQ_max) {
+                        sum = -FLT_MAX/2.0f;
+                    }
+                } else if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
                     sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
                 }
 
@@ -325,6 +368,16 @@ static __global__ void flash_attn_ext_vec(
         for (int k0 = 0; k0 < WARP_SIZE; k0 += V_cols_per_iter) {
             const int k = threadIdx.y*WARP_SIZE + k0 + (nthreads_V == WARP_SIZE ? 0 : threadIdx.x / nthreads_V);
 
+            // fc-inference TRACK B: paged gather for V (weight of clamped rows is 0 -> harmless read of cell 0)
+            const char * V_row;
+            if (BT_ptr) {
+                const int v  = k_VKQ_0 + k;
+                const int vc = v < k_VKQ_max ? v : 0;
+                V_row = V_base + ((int64_t) bt_pages[vc >> 8] * FATTN_KQ_STRIDE + (vc & (FATTN_KQ_STRIDE-1))) * (int64_t) nb21;
+            } else {
+                V_row = V + k*nb21;
+            }
+
 #ifdef V_DOT2_F32_F16_AVAILABLE
             half2 KQ_k[ncols];
 #pragma unroll
@@ -336,14 +389,14 @@ static __global__ void flash_attn_ext_vec(
                 half2 tmp[V_rows_per_thread/2];
                 if constexpr (type_V == GGML_TYPE_BF16) {
                     float2 tmp_f[V_rows_per_thread/2];
-                    dequantize_V(V + k*nb21, tmp_f,
+                    dequantize_V(V_row, tmp_f,
                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
 #pragma unroll
                     for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
                         tmp[i_VKQ_1] = __float22half2_rn(tmp_f[i_VKQ_1]);
                     }
                 } else {
-                    dequantize_V(V + k*nb21, tmp,
+                    dequantize_V(V_row, tmp,
                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
                 }
 #pragma unroll
@@ -363,7 +416,7 @@ static __global__ void flash_attn_ext_vec(
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
                 float2 tmp[V_rows_per_thread/2];
-                dequantize_V(V + k*nb21, tmp,
+                dequantize_V(V_row, tmp,
                     2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
 #pragma unroll
                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
@@ -514,7 +567,7 @@ static __global__ void flash_attn_ext_vec(
         dst_meta[((sequence*int(ne01.z) + ic0 + tid)*ne02 + head)*gridDim.y + blockIdx.y] = make_float2(KQ_max[tid], KQ_sum[tid]);
     }
 #else
-    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
+    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, BT_ptr, bt_nr, dst_ptr, dst_meta_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
         ne00, ne01, ne02, ne03,
               nb01, nb02, nb03,
@@ -551,7 +604,9 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
-    if (Q->ne[1] == 1) {
+    // fc-inference TRACK B: with a paged block table every Q token has its own BT column
+    // (own causal bound + page list), so column-blocking is invalid -> force ncols=1.
+    if (Q->ne[1] == 1 || dst->src[5]) {
         constexpr int cols_per_block = 1;
         if (logit_softcap == 0.0f) {
             constexpr bool use_logit_softcap = false;

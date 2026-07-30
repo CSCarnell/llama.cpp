@@ -30,7 +30,10 @@ static ggml_tensor * build_attn_inp_kq_mask(
         const llama_cparams & cparams) {
     const auto n_kv     = mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
-    const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+    // fc-inference: FC_USTREAM presents nseq mask-free per-stream views over the unified pool, so the
+    // mask must be [nkv_view, 1, 1, nseq] even though the KV cache is unified (kv_unified==true).
+    const auto n_stream = mctx->is_ustream() ? mctx->get_ustream_nseq()
+                        : (cparams.kv_unified ? 1 : ubatch.n_seqs_unq);
 
     // flash attention requires an f16 mask
     const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
@@ -49,7 +52,8 @@ static bool can_reuse_kq_mask(
         const llama_cparams & cparams) {
     const auto n_kv     = mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
-    const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+    const auto n_stream = mctx->is_ustream() ? mctx->get_ustream_nseq()
+                        : (cparams.kv_unified ? 1 : ubatch.n_seqs_unq);
 
     bool res = true;
 
@@ -494,6 +498,10 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
     }
 
+    if (self_bt && self_bt->buffer) {
+        mctx->set_input_bt(self_bt, ubatch); // fc-inference TRACK B
+    }
+
     if (self_k_rot) {
         mctx->set_input_k_rot(self_k_rot);
     }
@@ -514,6 +522,11 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+
+    // fc-inference TRACK B: BT is [1+max_pages, n_tokens]; rows are pool-constant, so only n_tokens matters
+    if (self_bt) {
+        res &= self_bt->ne[1] == params.ubatch.n_tokens;
+    }
 
     return res;
 }
@@ -2381,7 +2394,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * bt) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2417,6 +2431,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         cb(cur, LLAMA_TENSOR_NAME_FATTN, il);
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
+        ggml_flash_attn_ext_add_block_table(cur, bt); // fc-inference TRACK B (nullptr = no-op)
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
 
         if (v_mla) {
@@ -2601,6 +2616,8 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 
         inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
+
+        inp->self_bt = mctx_cur->build_input_bt(ctx0, ubatch); // fc-inference TRACK B (nullptr unless FC_PAGED)
     }
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
@@ -2665,7 +2682,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, inp->get_bt());
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {
