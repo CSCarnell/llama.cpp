@@ -3,6 +3,7 @@
 #include "cutlass-moe-fp4.cuh"
 #include "cutlass-moe-fp4-glue.cuh"
 #include "mmid.cuh"
+#include "common.cuh"   // ggml_cuda_info(), ggml_cuda_get_device(), GGML_CUDA_CC_*
 
 #include <cstdio>
 #include <mutex>
@@ -238,6 +239,22 @@ template<class V> static void* upload(const V& v, cudaStream_t s){
 }
 
 extern "C" int ggml_cuda_cutlass_moe_nvfp4_supported(int E, int N, int K){
+    // HARDWARE GATE (must come first).
+    // These are sm100/sm120 block-scaled CUTLASS kernels: they build TMA
+    // (Tensor Memory Accelerator) descriptors, which exist only on Hopper+ and
+    // whose block-scaled form we only instantiate for Blackwell. Without this
+    // check the gate was purely shape-based, so any pre-Blackwell GPU whose
+    // tensors happened to satisfy the N/K divisibility rules got dispatched
+    // into a Blackwell kernel and died in cuTensorMapEncodeTiled with
+    //   "Failed to initialize the TMA descriptor 801"  (801 = NOT_SUPPORTED)
+    // e.g. bge-small (N=K=384) on an RTX 4090 (sm_89). Falling through to MMQ
+    // is always correct here, just slower.
+    {
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_BLACKWELL) {
+            return 0;
+        }
+    }
     if (E <= 0 || N <= 0 || K <= 0) return 0;
     if (N % 128 != 0) return 0;                 // SFB swizzle atom = 128 rows
     if (K % FP4_SUPPORTED_KMULT != 0) return 0; // FP4 block/SF-atom K granularity

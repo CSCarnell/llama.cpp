@@ -150,6 +150,17 @@ if (CUDAToolkit_FOUND)
         target_compile_options(ggml-cuda PRIVATE
             $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
             $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
+        if (MSVC)
+            # MSVC reports __cplusplus as 199711L unless /Zc:__cplusplus is passed,
+            # so CUTLASS selects a pre-C++14 path in which dim3 is not a literal
+            # type, and every sm100/sm103 kernel header fails to compile with:
+            #   error: a constexpr function cannot have a nonliteral return type "dim3"
+            # CUTLASS's own CMakeLists.txt sets this flag for exactly this reason,
+            # but we consume CUTLASS as headers only, so we never picked it up.
+            # ggml's root CMakeLists adds /Zc:preprocessor but NOT /Zc:__cplusplus.
+            target_compile_options(ggml-cuda PRIVATE
+                $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:__cplusplus>)
+        endif()
     endif()
 
     # ---- cuDNN SDPA prefill flash-attention (Blackwell FA3-class kernels) ----
