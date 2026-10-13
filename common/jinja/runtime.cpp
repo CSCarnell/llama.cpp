@@ -687,48 +687,31 @@ value set_statement::execute_impl(context & ctx) {
 }
 
 static inline void bind_parameters(const std::string & name, const statements & this_args, const func_args & args, context & ctx) {
-    const size_t expected_count = this_args.size();
-    const size_t input_count = args.count();
-
-    JJ_DEBUG("Invoking '%s' with %zu input arguments (expected %zu)", name.c_str(), input_count, expected_count);
-    for (size_t i = 0; i < expected_count; ++i) {
-        if (i < input_count) {
-            if (is_stmt<identifier>(this_args[i])) {
-                // normal parameter
-                std::string param_name = cast_stmt<identifier>(this_args[i])->val;
-                value param_value = args.get_kwarg_or_pos(param_name, i);
-                JJ_DEBUG("  Binding parameter '%s' to argument of type %s", param_name.c_str(), param_value->type().c_str());
-                ctx.set_val(param_name, param_value);
-            } else if (is_stmt<keyword_argument_expression>(this_args[i])) {
-                // default argument used as normal parameter
-                auto kwarg = cast_stmt<keyword_argument_expression>(this_args[i]);
-                if (!is_stmt<identifier>(kwarg->key)) {
-                    throw std::runtime_error("Keyword argument key must be an identifier in '" + name + "'");
-                }
-                std::string param_name = cast_stmt<identifier>(kwarg->key)->val;
-                value param_value = args.get_kwarg_or_pos(param_name, i);
-                JJ_DEBUG("  Binding parameter '%s' to argument of type %s", param_name.c_str(), param_value->type().c_str());
-                ctx.set_val(param_name, param_value);
-            } else {
+    for (size_t i = 0; i < this_args.size(); ++i) {
+        std::string param_name;
+        const statement_ptr * default_value = nullptr;
+        if (is_stmt<identifier>(this_args[i])) {
+            param_name = cast_stmt<identifier>(this_args[i])->val;
+        } else if (is_stmt<keyword_argument_expression>(this_args[i])) {
+            auto kwarg = cast_stmt<keyword_argument_expression>(this_args[i]);
+            if (!is_stmt<identifier>(kwarg->key)) {
                 throw std::runtime_error("Invalid parameter type in '" + name + "'");
             }
+            param_name = cast_stmt<identifier>(kwarg->key)->val;
+            default_value = &kwarg->val;
         } else {
-            auto & default_arg = this_args[i];
-            if (is_stmt<keyword_argument_expression>(default_arg)) {
-                auto kwarg = cast_stmt<keyword_argument_expression>(default_arg);
-                if (!is_stmt<identifier>(kwarg->key)) {
-                    throw std::runtime_error("Keyword argument key must be an identifier in '" + name + "'");
-                }
-                std::string param_name = cast_stmt<identifier>(kwarg->key)->val;
-                JJ_DEBUG("  Binding parameter '%s' to default argument of type %s", param_name.c_str(), kwarg->val->type().c_str());
-                ctx.set_val(param_name, kwarg->val->execute(args.ctx));
-            } else {
-                throw std::runtime_error("Not enough arguments provided to '" + name + "'");
-            }
-            //std::string param_name = cast_stmt<identifier>(default_args[i])->val;
-            //JJ_DEBUG("  Binding parameter '%s' to default", param_name.c_str());
-            //ctx.var[param_name] = default_args[i]->execute(ctx);
+            throw std::runtime_error("Invalid parameter type in '" + name + "'");
         }
+        // Keywords can skip earlier parameters. Jinja binds omitted required
+        // parameters to Undefined, not an argument-count error.
+        value bound = args.get_kwarg(param_name, nullptr);
+        if (!bound && i < args.count() && !is_val<value_kwarg>(args.get_args()[i])) {
+            bound = args.get_args()[i];
+        }
+        if (!bound) {
+            bound = default_value ? (*default_value)->execute(ctx) : mk_val<value_undefined>(param_name);
+        }
+        ctx.set_val(param_name, bound);
     }
 }
 

@@ -966,6 +966,16 @@ static void test_comments(testing & t) {
 }
 
 static void test_macros(testing & t) {
+    test_template(t, "macro skipped required argument with later keyword",
+        "{% macro render(content, thinking, images) %}{{ content }}:{{ thinking is undefined }}:{{ images }}{% endmacro %}{{ render('tool', images=true) }}",
+        json::object(), "tool:True:True");
+    test_template(t, "macro skipped default with later keyword",
+        "{% macro render(a='default', b=false) %}{{ a }}:{{ b }}{% endmacro %}{{ render(b=true) }}",
+        json::object(), "default:True");
+    test_template(t, "macro default references prior parameter",
+        "{% macro render(a, b=a) %}{{ b }}{% endmacro %}{{ render('tool') }}",
+        json::object(), "tool");
+
     test_template(t, "simple macro",
         "{% macro greet(name) %}Hello {{ name }}{% endmacro %}{{ greet('World') }}",
         json::object(),
