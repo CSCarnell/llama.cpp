@@ -33,7 +33,7 @@ enum resize_algo {
     RESIZE_ALGO_BILINEAR, // stretch to target resolution
     RESIZE_ALGO_BICUBIC, // center-crop when aspect ratio doesn't match
     RESIZE_ALGO_BICUBIC_PILLOW,
-    // RESIZE_ALGO_LANCZOS, // TODO
+    RESIZE_ALGO_LANCZOS,
 };
 
 // Padding style for img_tool::resize
@@ -105,6 +105,11 @@ struct clip_hparams {
     std::vector<int32_t> proj_spatial_offsets;
     int32_t downsample_query_side;
     int32_t downsample_window_side;
+
+    // Muse Glimmer vision (per-block sparse-window pattern, learned pos-emb, patch-temporal)
+    // NOTE: these perhaps shouldn't have the architecture prefix
+    int32_t muse_glimmer_patch_temporal = 0;
+    int32_t muse_glimmer_sparse_factor  = 0;
 
     // audio
     int32_t n_mel_bins = 0; // whisper preprocessor

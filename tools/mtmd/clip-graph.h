@@ -13,6 +13,7 @@
 
 struct build_vit_opts {
     ggml_tensor * attn_mask = nullptr;
+    std::vector<ggml_tensor *> attn_mask_layers;
 };
 
 struct clip_graph {
