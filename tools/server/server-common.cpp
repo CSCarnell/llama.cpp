@@ -1075,6 +1075,20 @@ json oaicompat_chat_params_parse(
         inputs.chat_template_kwargs[item.key()] = item.value().dump();
     }
 
+    // Mistral Small 4 defaults to reasoning unless the request or launch config
+    // explicitly overrides it. Other models retain their template defaults.
+    const auto template_source = common_chat_templates_source(opt.tmpls.get());
+    if (template_source.find("Mistral-Small-4") != std::string::npos &&
+        template_source.find("reasoning_effort") != std::string::npos &&
+        inputs.chat_template_kwargs.count("reasoning_effort") == 0) {
+        inputs.chat_template_kwargs["reasoning_effort"] = "\"high\"";
+    }
+    if (body.contains("reasoning_effort") && !body.at("reasoning_effort").is_null()) {
+        if (!body.at("reasoning_effort").is_string()) {
+            throw std::invalid_argument("reasoning_effort must be a string");
+        }
+        inputs.chat_template_kwargs["reasoning_effort"] = body.at("reasoning_effort").dump();
+    }
     // parse the "enable_thinking" kwarg to override the default value
     auto enable_thinking_kwarg = json_value(inputs.chat_template_kwargs, "enable_thinking", std::string(""));
     if (enable_thinking_kwarg == "true") {
