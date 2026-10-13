@@ -127,6 +127,7 @@ void llama_model_deepseek2::load_arch_tensors(llama_model_loader &) {
                 throw std::runtime_error("n_expert_used must be > 0");
             }
 
+            // NVFP4 weights require their global scales for both routed and shared experts.
             // MoE branch
             layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
             create_tensor_gate_up_exps(layer, i, n_embd, n_ff_exp, n_expert, 0);
@@ -383,6 +384,7 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
                 NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
             cb(cur, "ffn_out", il);
         } else {
+            // NVFP4 weights require their global scales for both routed and shared experts.
             // MoE branch
             ggml_tensor * moe_out = build_moe_ffn(cur,
                 model.layers[il].ffn_gate_inp,
@@ -396,16 +398,19 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
                 (llama_expert_gating_func_type) hparams.expert_gating_func,
                 il,
                 nullptr,
-                model.layers[il].ffn_gate_up_exps);
+                model.layers[il].ffn_gate_up_exps,
+                model.layers[il].ffn_up_exps_s,
+                model.layers[il].ffn_gate_exps_s,
+                model.layers[il].ffn_down_exps_s);
             cb(moe_out, "ffn_moe_out", il);
 
             // FFN shared expert
             {
                 ggml_tensor * ffn_shexp =
                     build_ffn(cur,
-                        model.layers[il].ffn_up_shexp, NULL, NULL,
-                        model.layers[il].ffn_gate_shexp, NULL, NULL,
-                        model.layers[il].ffn_down_shexp, NULL, NULL,
+                        model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
+                        model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
+                        model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
                         NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
                 cb(ffn_shexp, "ffn_shexp", il);
 
