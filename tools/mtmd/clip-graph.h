@@ -40,6 +40,7 @@ struct clip_graph {
 
     // TODO [QWEN_VIDEO]: improve this in the future
     int n_batch = 1;
+    bool is_video = false;
 
     ggml_context_ptr ctx0_ptr;
     ggml_context * ctx0;
